@@ -4,9 +4,10 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Your Google Sheet IDs (already filled in)
+# Your Google Sheet IDs
 JOBS_SHEET_ID = "1viyKdvfA5BN3g1gF8ZMWlTZmsafiXwOqNw6oVgkguJ0"
 SUBSCRIBERS_SHEET_ID = "1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g"
+
 
 def get_gspread_client():
     """
@@ -20,16 +21,19 @@ def get_gspread_client():
 
     credentials = Credentials.from_service_account_info(
         service_account_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(credentials)
+
 
 def get_jobs_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(JOBS_SHEET_ID)
     return sh.sheet1  # uses first tab
 
+
 def get_subscribers_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(SUBSCRIBERS_SHEET_ID)
     return sh.sheet1  # uses first tab
+

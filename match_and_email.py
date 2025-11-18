@@ -74,27 +74,47 @@ def days_since(dt_str: str) -> float:
 
 # ---------- Frequency logic ----------
 
+def _normalize_freq(raw: str) -> str:
+    """
+    Normalize various frequency strings from the sheet / UI into:
+    - "daily"
+    - "twice_weekly"
+    - "weekly"
+    """
+    if not raw:
+        return "daily"
+    f = raw.strip().lower()
+
+    # UI sends "2x" for 2× per week
+    if f in {"2x", "2x per week", "2x/week", "twice_weekly", "2x_week", "twice weekly"}:
+        return "twice_weekly"
+    if f == "weekly":
+        return "weekly"
+    if f == "daily":
+        return "daily"
+
+    # Fallback to daily if unknown
+    return "daily"
+
+
 def is_due_to_send(sub: Dict[str, Any]) -> bool:
     """
     Decide if we should send a digest to this subscriber today,
     based on frequency + last_sent_at.
     """
-    freq = (sub.get("frequency") or "").strip().lower()
+    freq = _normalize_freq(sub.get("frequency") or "")
     last_sent = sub.get("last_sent_at") or ""
     days = days_since(last_sent)
 
-    # default: daily
-    if not freq:
-        freq = "daily"
-
     if freq == "daily":
         return days >= 1
-    if freq in ["twice_weekly", "2x_week", "twice weekly"]:
+    if freq == "twice_weekly":
+        # ~2x per week → every 3 days
         return days >= 3
     if freq == "weekly":
         return days >= 7
 
-    # fallback
+    # fallback (shouldn't hit because of _normalize_freq)
     return days >= 1
 
 
@@ -168,6 +188,11 @@ def match_employment(job_type: str, pref_type: str) -> bool:
 
 
 def match_high_salary(job: Dict[str, Any], high_salary_only: bool) -> bool:
+    """
+    If high_salary_only is True:
+    - honour the boolean high_salary flag from the sheet
+    - otherwise require min_salary >= 100,000 (USD or equivalent)
+    """
     if not high_salary_only:
         return True
 
@@ -180,8 +205,8 @@ def match_high_salary(job: Dict[str, Any], high_salary_only: bool) -> bool:
     except Exception:
         min_salary = 0
 
-    # basic global threshold – tune later
-    return min_salary >= 80000
+    # Align with UI copy: "$100k+"
+    return min_salary >= 100000
 
 
 def match_tech_and_lang(job: Dict[str, Any], sub: Dict[str, Any]) -> bool:
@@ -368,7 +393,6 @@ def main():
             continue
 
         if not is_due_to_send(sub):
-            # print(f"Skipping {email}, not due yet.")
             continue
 
         matched = []

@@ -37,6 +37,9 @@ KNOWN_TECH_KEYWORDS = {
     "python", "java", "javascript", "typescript", "go", "golang", "ruby", "php",
     "c", "c++", "c#", "scala", "rust", "kotlin", "swift",
 
+    # node / backend
+    "node", "node.js", "nodejs", "express",
+
     # frameworks / libs
     "django", "flask", "fastapi", "spring", "rails", "laravel",
     "react", "reactjs", "react.js", "nextjs", "next.js", "vue", "vuejs",
@@ -59,6 +62,31 @@ KNOWN_TECH_KEYWORDS = {
     "figma", "photoshop", "illustrator", "adobe xd",
 }
 
+# Tags we want to drop from the sheet because they add noise
+NOISE_TAGS = {
+    "digital nomad",
+    "non tech",
+    "non-technical",
+    "full-time",
+    "full time",
+    "part-time",
+    "part time",
+    "permanent",
+    "contract",
+    "freelance",
+    "temporary",
+    "temp",
+    "remote",
+    "work from home",
+    "wfh",
+    "job",
+    "jobs",
+    "hiring",
+    "role",
+    "position",
+}
+
+
 # --------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------
@@ -77,6 +105,9 @@ def _normalize_text(s: Optional[str]) -> str:
 
 
 def _tags_to_list(tags: Any) -> List[str]:
+    """
+    Convert tags from API to a simple list of strings.
+    """
     if tags is None:
         return []
     if isinstance(tags, list):
@@ -84,6 +115,30 @@ def _tags_to_list(tags: Any) -> List[str]:
     if isinstance(tags, str):
         return [t.strip() for t in tags.split(",") if t.strip()]
     return [str(tags).strip()]
+
+
+def clean_tags_list(raw_tags: Any) -> List[str]:
+    """
+    - Remove duplicates
+    - Drop noisy / generic tags (digital nomad, full-time, remote, etc.)
+    - Preserve original order for the rest
+    """
+    tags = _tags_to_list(raw_tags)
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+
+    for tag in tags:
+        lower = tag.strip().lower()
+        if not lower:
+            continue
+        if lower in NOISE_TAGS:
+            continue
+        if lower in seen:
+            continue
+        seen.add(lower)
+        cleaned.append(lower)  # store as lowercase for consistency
+
+    return cleaned
 
 
 def _parse_float(value: Any) -> Optional[float]:
@@ -134,11 +189,7 @@ def compute_remote_scope(location: str) -> str:
     if any(m in lower for m in region_markers):
         return "regional"
 
-    # If location is a comma-separated list of countries / regions, treat as regional
-    if "," in loc:
-        return "regional"
-
-    # Country-level heuristics: single-token countries / well-known short codes
+    # Country-level heuristics
     country_tokens = {
         "usa", "us", "united states",
         "canada", "uk", "united kingdom",
@@ -156,11 +207,12 @@ def compute_remote_scope(location: str) -> str:
     if lower in country_tokens:
         return "country"
 
-    # If it looks like "Remote - USA" style
+    # If it looks like "Remote - USA" / "Anywhere in Canada" style
     for c in country_tokens:
         if c in lower:
             return "country"
 
+    # City-only, state-only, or ambiguous → unknown
     return "unknown"
 
 
@@ -176,11 +228,13 @@ def normalize_role(title: str, tags: Any) -> str:
     text = f"{title} {' '.join(_tags_to_list(tags))}".lower()
 
     role_patterns = [
+        # Data
         ("Data Scientist", ["data scientist"]),
         ("Machine Learning Engineer", ["ml engineer", "machine learning engineer"]),
         ("Data Engineer", ["data engineer"]),
-        ("Data Analyst", ["data analyst", "analytics engineer"]),
+        ("Data Analyst", ["data analyst", "analytics engineer", "business intelligence analyst", "bi analyst"]),
 
+        # Engineering
         ("DevOps Engineer", ["devops", "site reliability", "sre"]),
         ("Backend Engineer", ["backend engineer", "back-end engineer", "backend developer", "server engineer"]),
         ("Frontend Engineer", ["frontend engineer", "front-end engineer", "frontend developer", "front end developer", "ui engineer"]),
@@ -188,31 +242,41 @@ def normalize_role(title: str, tags: Any) -> str:
         ("Mobile Engineer", ["mobile engineer", "mobile developer", "ios engineer", "android engineer"]),
         ("Software Engineer", ["software engineer", "software developer", "swe"]),
 
+        # Product / Design
         ("Product Manager", ["product manager", "product owner"]),
         ("Product Designer", ["product designer"]),
         ("UX/UI Designer", ["ux designer", "ui designer", "ux/ui", "ux ui"]),
 
+        # Marketing / Growth
         ("Marketing Manager", ["marketing manager", "digital marketing manager"]),
         ("Growth Marketer", ["growth marketer", "growth marketing"]),
         ("Content Marketer", ["content marketer", "content marketing", "copywriter", "copy writer"]),
+        ("Social Media Manager", ["social media manager", "social media", "community manager"]),
 
-        ("Sales Representative", ["sales development", "sdr", "sales representative"]),
+        # Sales / CS
+        ("Sales Representative", ["sales development", "sdr", "sales representative", "business development representative", "bdr"]),
         ("Account Executive", ["account executive", "ae"]),
         ("Customer Success Manager", ["customer success", "cs manager"]),
         ("Support Specialist", ["customer support", "support specialist", "technical support", "helpdesk", "help desk"]),
 
-        ("Recruiter", ["recruiter", "talent acquisition"]),
+        # People / Ops
+        ("Recruiter", ["recruiter", "talent acquisition", "talent partner"]),
         ("HR Generalist", ["hr generalist"]),
         ("People Operations", ["people ops", "people operations"]),
 
         ("Operations Manager", ["operations manager", "ops manager", "business operations"]),
         ("Project Manager", ["project manager", "program manager"]),
 
+        # Finance / Legal
         ("Finance Manager", ["finance manager", "fp&a", "financial analyst"]),
         ("Accountant", ["accountant"]),
 
         ("Legal Counsel", ["legal counsel", "attorney", "lawyer"]),
 
+        # Healthcare / non-tech specific
+        ("Behavior Analyst", ["bcba", "board certified behavior analyst", "behavior analyst", "behaviour analyst"]),
+
+        # Leadership / intern
         ("Founder / CEO", ["founder", "co-founder", "ceo"]),
         ("CTO", ["cto", "chief technology officer"]),
         ("COO", ["coo", "chief operating officer"]),
@@ -260,6 +324,7 @@ def normalize_category(title: str, tags: Any, role: Optional[str] = None) -> str
         "Marketing Manager": "Marketing",
         "Growth Marketer": "Marketing",
         "Content Marketer": "Marketing",
+        "Social Media Manager": "Marketing",
         "Sales Representative": "Sales",
         "Account Executive": "Sales",
         "Customer Success Manager": "Customer Support",
@@ -277,6 +342,9 @@ def normalize_category(title: str, tags: Any, role: Optional[str] = None) -> str
         "Accountant": "Finance",
         "Legal Counsel": "Legal",
 
+        # Healthcare / non-tech
+        "Behavior Analyst": "Other",
+
         # Leadership / Intern
         "Founder / CEO": "Leadership",
         "CTO": "Leadership",
@@ -292,17 +360,26 @@ def normalize_category(title: str, tags: Any, role: Optional[str] = None) -> str
 
     keyword_category = [
         ("Engineering", ["engineer", "developer", "devops", "sre"]),
-        ("Data", ["data", "analytics", "machine learning", "ml"]),
+        ("Data", [
+            "data scientist",
+            "data engineer",
+            "data analyst",
+            "analytics engineer",
+            "business intelligence",
+            "bi analyst",
+            "machine learning",
+            "ml engineer",
+        ]),
         ("Design", ["designer", "ux", "ui"]),
         ("Product", ["product manager", "product owner"]),
-        ("Marketing", ["marketing", "growth", "demand gen", "performance marketing"]),
+        ("Marketing", ["marketing", "growth", "demand gen", "performance marketing", "social media", "community manager"]),
         ("Sales", ["sales", "account executive", "sdr", "bdr"]),
         ("Customer Support", ["customer support", "support specialist", "customer success"]),
         ("People/HR", ["recruiter", "talent", "hr", "people ops"]),
         ("Operations", ["operations", "ops manager", "program manager"]),
         ("Finance", ["finance", "accountant", "fp&a"]),
-        ("Legal", ["legal", "counsel", "attorney"]),
-        ("Leadership", ["head of", "vp", "vice president", "chief", "c-level", "cxo"]),
+        ("Legal", ["legal counsel", "attorney", "lawyer", "paralegal"]),
+        ("Leadership", ["head of", "vp", "vice president", "chief ", "c-level", "cxo"]),
         ("Internship", ["intern", "internship"]),
     ]
 
@@ -375,14 +452,14 @@ def extract_tech_stack(tags: Any) -> List[str]:
         # Exact/multi-word match
         if lower in KNOWN_TECH_KEYWORDS:
             if normalized not in seen:
-                techs.append(tag)
+                techs.append(lower)
                 seen.add(normalized)
             continue
 
         # Heuristic: languages with special chars
         if any(ch in tag for ch in ["#", "+", ".NET", ".net"]):
             if normalized not in seen:
-                techs.append(tag)
+                techs.append(lower)
                 seen.add(normalized)
             continue
 
@@ -537,9 +614,9 @@ def _normalize_remoteok_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     # Location: RemoteOK often has "location" or "region"
     location = job.get("location") or job.get("region") or job.get("country") or "Remote"
 
-    # Tags & tech stack
-    tags_list = job.get("tags") or []
-    tags_list = _tags_to_list(tags_list)
+    # Tags & tech stack (cleaned)
+    raw_tags = job.get("tags") or []
+    tags_list = clean_tags_list(raw_tags)
     tags_str = ", ".join(tags_list)
     tech_stack_list = extract_tech_stack(tags_list)
     tech_stack_str = ", ".join(tech_stack_list)

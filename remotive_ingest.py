@@ -36,6 +36,7 @@ from remoteok_ingest import (
     is_high_salary,
     HIGH_SALARY_THRESHOLD,
     compute_remote_scope,
+    clean_tags_list,
 )
 
 load_dotenv()
@@ -161,10 +162,8 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
         return None
 
     # Tags – Remotive gives a list of strings in "tags"
-    tags_list = job.get("tags") or []
-    if not isinstance(tags_list, list):
-        tags_list = []
-    tags_list = [str(t).strip() for t in tags_list if str(t).strip()]
+    raw_tags = job.get("tags") or []
+    tags_list = clean_tags_list(raw_tags)
     tags_str = ", ".join(tags_list)
 
     tech_stack_list = extract_tech_stack(tags_list)

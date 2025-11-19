@@ -53,12 +53,28 @@ def iso_now() -> str:
 
 
 def parse_iso(dt_str: str) -> Optional[datetime]:
+    """
+    Parse an ISO string and ALWAYS return a timezone-aware UTC datetime.
+
+    Handles:
+    - strings with 'Z'
+    - strings with explicit offsets
+    - naive strings (assumed UTC)
+    """
     if not dt_str:
         return None
     try:
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        cleaned = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
     except Exception:
         return None
+
+    # If naive, assume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    # Normalise to UTC
+    return dt.astimezone(timezone.utc)
 
 
 def parse_csv(value: str) -> List[str]:
@@ -79,6 +95,7 @@ def days_since(dt_str: str) -> float:
     dt = parse_iso(dt_str)
     if not dt:
         return 9999
+    # dt is guaranteed timezone-aware UTC, so subtraction is safe
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
 
 
@@ -508,7 +525,10 @@ def match_high_salary(job: Dict[str, Any], high_salary_only: bool) -> bool:
 
     min_salary = parse_salary(job.get("min_salary"))
     max_salary = parse_salary(job.get("max_salary"))
-    candidate = max(filter(lambda x: x is not None, [min_salary, max_salary]), default=None)
+    candidate = max(
+        filter(lambda x: x is not None, [min_salary, max_salary]),
+        default=None,
+    )
 
     if candidate is None:
         return False
@@ -829,3 +849,7 @@ def main():
             subs_sheet.update_cell(row_idx, last_sent_col, iso_now())
 
     print("[MATCH] Done matching & (dry-run) sending.")
+
+
+if __name__ == "__main__":
+    main()

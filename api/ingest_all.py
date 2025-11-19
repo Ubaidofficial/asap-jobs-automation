@@ -15,75 +15,79 @@ logger.setLevel(logging.INFO)
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """
-        Vercel Python entrypoint for GET /api/ingest_all
+        GET /api/ingest_all
 
-        Calls:
-        - ingest_remoteok()
-        - ingest_remotive()
-        - ingest_remote_companies()
+        Runs all ingestors:
+        - RemoteOK
+        - Remotive
+        - Remote-first companies (placeholder)
 
-        Returns JSON with per-source counts and any errors.
+        Returns a JSON object with per-source results.
         """
-        results = {}
-        overall_ok = True
+
+        sources = {}
 
         # RemoteOK
         try:
             inserted_remoteok = ingest_remoteok()
-            results["remoteok"] = {
+            sources["remoteok"] = {
                 "status": "success",
                 "inserted": inserted_remoteok,
             }
         except Exception as e:
             logger.exception("Error ingesting RemoteOK: %s", e)
-            results["remoteok"] = {
+            sources["remoteok"] = {
                 "status": "error",
                 "inserted": 0,
                 "error": str(e),
             }
-            overall_ok = False
 
         # Remotive
         try:
             inserted_remotive = ingest_remotive()
-            results["remotive"] = {
+            sources["remotive"] = {
                 "status": "success",
                 "inserted": inserted_remotive,
             }
         except Exception as e:
             logger.exception("Error ingesting Remotive: %s", e)
-            results["remotive"] = {
+            sources["remotive"] = {
                 "status": "error",
                 "inserted": 0,
                 "error": str(e),
             }
-            overall_ok = False
 
-        # Remote-first companies
+        # Remote companies (placeholder)
         try:
-            inserted_remote_companies = ingest_remote_companies()
-            results["remote_companies"] = {
+            inserted_rc = ingest_remote_companies()
+            sources["remote_companies"] = {
                 "status": "success",
-                "inserted": inserted_remote_companies,
+                "inserted": inserted_rc,
             }
         except Exception as e:
             logger.exception("Error ingesting remote companies: %s", e)
-            results["remote_companies"] = {
+            sources["remote_companies"] = {
                 "status": "error",
                 "inserted": 0,
                 "error": str(e),
             }
-            overall_ok = False
+
+        # Overall status
+        overall_status = "success"
+        for s in sources.values():
+            if s["status"] != "success":
+                overall_status = "partial"
+                break
 
         payload = {
-            "status": "success" if overall_ok else "partial",
+            "status": overall_status,
             "message": "Ingested from all sources (see per-source results).",
-            "sources": results,
+            "sources": sources,
         }
 
         body = json.dumps(payload).encode("utf-8")
 
-        self.send_response(200 if overall_ok else 207)  # 207 = multi-status-ish
+        self.send_response(200 if overall_status == "success" else 207)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

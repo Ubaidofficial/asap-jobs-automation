@@ -12,10 +12,6 @@ We map into the same Jobs sheet schema as RemoteOK:
     high_salary, posted_at, ingested_at, remote_scope
 
 We dedupe on (source, source_job_id).
-
-NEW:
-- extra filtering:
-    only insert rows where remote_scope ∈ {global, country, regional}
 """
 
 import os
@@ -95,7 +91,6 @@ def _is_remote_or_hybrid(
         "work-from-home",
         "anywhere",
         "worldwide",
-        "world wide",
         "global",
         "distributed team",
     ]
@@ -145,8 +140,6 @@ def _is_remote_or_hybrid(
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Map a Remotive job JSON object to our Jobs sheet columns.
-    Only returns rows that are clearly remote/hybrid
-    (remote_scope ∈ {global, country, regional}).
     """
     job_id = job.get("id")
     if not job_id:
@@ -165,11 +158,6 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
 
     # Filter to remote / hybrid only (extra safety)
     if not _is_remote_or_hybrid(location, job_type, title, description):
-        return None
-
-    # Classify remote_scope and filter on it
-    remote_scope = compute_remote_scope(location)
-    if remote_scope not in {"global", "country", "regional"}:
         return None
 
     # Tags – Remotive gives a list of strings in "tags"
@@ -211,6 +199,8 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     seniority = extract_seniority(title, tags_list)
     employment_type = extract_employment_type(job_type, tags_list)
 
+    remote_scope = compute_remote_scope(location)
+
     row_dict: Dict[str, Any] = {
         "id": row_id,
         "title": title,
@@ -248,13 +238,14 @@ def ingest_remotive() -> int:
     """
     Fetch Remotive jobs and append new ones to the Jobs sheet.
     Returns the number of rows inserted.
-    Only remote/hybrid jobs with valid remote_scope are inserted.
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
 
     # Build existing key set (source:source_job_id)
-    existing_records = sheet.get_all_records()
+    # ✅ pass expected_headers to avoid "header row not unique" error
+    existing_records = sheet.get_all_records(expected_headers=headers)
+
     existing_keys: Set[str] = set()
     for row in existing_records:
         source = _normalize_text(row.get("source"))
@@ -289,7 +280,7 @@ def ingest_remotive() -> int:
 
         row_dict = _normalize_remotive_job(job, headers)
         if not row_dict:
-            continue  # filtered out (non-remote/hybrid or invalid)
+            continue
 
         row_values = [row_dict.get(col, "") for col in headers]
         new_rows.append(row_values)
@@ -307,3 +298,4 @@ def ingest_remotive() -> int:
 if __name__ == "__main__":
     count = ingest_remotive()
     print(f"Ingested {count} new Remotive jobs.")
+    

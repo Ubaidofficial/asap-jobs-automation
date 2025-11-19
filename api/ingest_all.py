@@ -57,7 +57,7 @@ class handler(BaseHTTPRequestHandler):
                 "error": str(e),
             }
 
-        # Remote companies (placeholder)
+        # Remote-first companies (placeholder for now)
         try:
             inserted_rc = ingest_remote_companies()
             sources["remote_companies"] = {

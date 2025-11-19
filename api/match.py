@@ -20,6 +20,7 @@ class handler(BaseHTTPRequestHandler):
             status = 200
             payload = {
                 "status": "success",
+                "source": "match",
                 "message": "ASAP Jobs matching ran successfully",
             }
             print("[API] /api/match completed successfully")
@@ -31,6 +32,7 @@ class handler(BaseHTTPRequestHandler):
             status = 500
             payload = {
                 "status": "error",
+                "source": "match",
                 "message": str(e),
             }
 

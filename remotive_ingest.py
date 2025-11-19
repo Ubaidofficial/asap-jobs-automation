@@ -12,6 +12,9 @@ We map into the same Jobs sheet schema as RemoteOK:
     high_salary, posted_at, ingested_at, remote_scope
 
 We dedupe on (source, source_job_id).
+
+⚠️ NEW: We only keep jobs where our `remote_scope` classifier returns
+        "global", "country" or "regional". Others are dropped.
 """
 
 import os
@@ -36,7 +39,6 @@ from remoteok_ingest import (
     is_high_salary,
     HIGH_SALARY_THRESHOLD,
     compute_remote_scope,
-    clean_tags_list,
 )
 
 load_dotenv()
@@ -141,6 +143,10 @@ def _is_remote_or_hybrid(
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Map a Remotive job JSON object to our Jobs sheet columns.
+
+    Only returns rows that are:
+    - remote/hybrid according to `_is_remote_or_hybrid`, AND
+    - have `remote_scope` in {"global", "country", "regional"}.
     """
     job_id = job.get("id")
     if not job_id:
@@ -161,9 +167,16 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     if not _is_remote_or_hybrid(location, job_type, title, description):
         return None
 
+    # Classify remote_scope and drop ambiguous ("unknown") ones
+    remote_scope = compute_remote_scope(location)
+    if remote_scope not in {"global", "country", "regional"}:
+        return None
+
     # Tags – Remotive gives a list of strings in "tags"
-    raw_tags = job.get("tags") or []
-    tags_list = clean_tags_list(raw_tags)
+    tags_list = job.get("tags") or []
+    if not isinstance(tags_list, list):
+        tags_list = []
+    tags_list = [str(t).strip() for t in tags_list if str(t).strip()]
     tags_str = ", ".join(tags_list)
 
     tech_stack_list = extract_tech_stack(tags_list)
@@ -197,8 +210,6 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     category = normalize_category(title, tags_list, role)
     seniority = extract_seniority(title, tags_list)
     employment_type = extract_employment_type(job_type, tags_list)
-
-    remote_scope = compute_remote_scope(location)
 
     row_dict: Dict[str, Any] = {
         "id": row_id,

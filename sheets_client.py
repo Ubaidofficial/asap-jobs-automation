@@ -36,4 +36,3 @@ def get_subscribers_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(SUBSCRIBERS_SHEET_ID)
     return sh.sheet1  # uses first tab
-

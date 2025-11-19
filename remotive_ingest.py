@@ -13,8 +13,9 @@ We map into the same Jobs sheet schema as RemoteOK:
 
 We dedupe on (source, source_job_id).
 
-⚠️ NEW: We only keep jobs where our `remote_scope` classifier returns
-        "global", "country" or "regional". Others are dropped.
+NEW:
+- extra filtering:
+    only insert rows where remote_scope ∈ {global, country, regional}
 """
 
 import os
@@ -94,6 +95,7 @@ def _is_remote_or_hybrid(
         "work-from-home",
         "anywhere",
         "worldwide",
+        "world wide",
         "global",
         "distributed team",
     ]
@@ -143,10 +145,8 @@ def _is_remote_or_hybrid(
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Map a Remotive job JSON object to our Jobs sheet columns.
-
-    Only returns rows that are:
-    - remote/hybrid according to `_is_remote_or_hybrid`, AND
-    - have `remote_scope` in {"global", "country", "regional"}.
+    Only returns rows that are clearly remote/hybrid
+    (remote_scope ∈ {global, country, regional}).
     """
     job_id = job.get("id")
     if not job_id:
@@ -167,7 +167,7 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     if not _is_remote_or_hybrid(location, job_type, title, description):
         return None
 
-    # Classify remote_scope and drop ambiguous ("unknown") ones
+    # Classify remote_scope and filter on it
     remote_scope = compute_remote_scope(location)
     if remote_scope not in {"global", "country", "regional"}:
         return None
@@ -248,6 +248,7 @@ def ingest_remotive() -> int:
     """
     Fetch Remotive jobs and append new ones to the Jobs sheet.
     Returns the number of rows inserted.
+    Only remote/hybrid jobs with valid remote_scope are inserted.
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
@@ -288,7 +289,7 @@ def ingest_remotive() -> int:
 
         row_dict = _normalize_remotive_job(job, headers)
         if not row_dict:
-            continue
+            continue  # filtered out (non-remote/hybrid or invalid)
 
         row_values = [row_dict.get(col, "") for col in headers]
         new_rows.append(row_values)

@@ -9,9 +9,8 @@ Fetch jobs from RemoteOK and store them in the Jobs Google Sheet.
     tags, tech_stack, min_salary, max_salary, currency,
     high_salary, posted_at, ingested_at, remote_scope
 - Skips jobs that already exist (same source + source_job_id)
-- ⚠️ NEW: Only stores jobs where `remote_scope` ∈ {global, country, regional}
-  (i.e. clearly remote / hybrid). Anything with `remote_scope = "unknown"`
-  is discarded and never written to the sheet.
+- NEW: Filters to remote / hybrid only at ingestion time:
+    only rows with remote_scope ∈ {global, country, regional} are inserted.
 """
 
 import os
@@ -111,6 +110,7 @@ def compute_remote_scope(location: str) -> str:
     - "global"   -> worldwide / anywhere / global remote
     - "regional" -> region-based (EMEA, LATAM, APAC, Europe, etc.)
     - "country"  -> specific country-level (USA, Canada, UK, Germany, etc.)
+    - "onsite"   -> explicitly non-remote/office-only
     - "unknown"  -> anything ambiguous or too specific (city-only, etc.)
     """
     loc = (location or "").strip()
@@ -119,8 +119,23 @@ def compute_remote_scope(location: str) -> str:
 
     lower = loc.lower()
 
+    # Onsite / office-only markers
+    onsite_markers = [
+        "onsite only",
+        "on-site only",
+        "onsite",
+        "on-site",
+        "in office",
+        "in-office",
+        "no remote",
+        "not remote",
+        "office-based",
+    ]
+    if any(m in lower for m in onsite_markers):
+        return "onsite"
+
     # Global
-    if any(k in lower for k in ["worldwide", "anywhere", "global"]):
+    if any(k in lower for k in ["worldwide", "world wide", "anywhere", "global"]):
         return "global"
     if lower in {"remote", "remote only"}:
         return "global"
@@ -522,10 +537,8 @@ def _ensure_headers(sheet) -> List[str]:
 def _normalize_remoteok_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Convert one RemoteOK job object into a dict keyed by column name.
-
-    ⚠️ Only returns a row dict for clearly remote/hybrid jobs:
-       `remote_scope` must be one of {"global", "country", "regional"}.
-       Otherwise returns None (job is ignored).
+    Only returns a row for clearly remote/hybrid jobs
+    (remote_scope ∈ {global, country, regional}).
     """
     job_id = job.get("id")
     if not job_id:
@@ -544,10 +557,10 @@ def _normalize_remoteok_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     # Location: RemoteOK often has "location" or "region"
     location = job.get("location") or job.get("region") or job.get("country") or "Remote"
 
-    # Compute remote_scope FIRST and drop non-remote/hybrid
+    # Classify remote_scope; filter non-remote at ingestion
     remote_scope = compute_remote_scope(location)
     if remote_scope not in {"global", "country", "regional"}:
-        # Skip on-site / ambiguous city-only roles
+        # Skip non-remote / onsite / unknown-location jobs
         return None
 
     # Tags & tech stack
@@ -619,6 +632,7 @@ def ingest_remoteok() -> int:
     """
     Fetch RemoteOK jobs and append new ones to the Jobs sheet.
     Returns the number of rows inserted (int).
+    Only remote/hybrid jobs are inserted.
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
@@ -665,7 +679,7 @@ def ingest_remoteok() -> int:
 
         row_dict = _normalize_remoteok_job(job, headers)
         if not row_dict:
-            continue
+            continue  # filtered out (non-remote/hybrid or invalid)
 
         # Build row in correct column order
         row_values = [row_dict.get(col, "") for col in headers]

@@ -132,7 +132,35 @@ def job_is_recent(job: Dict[str, Any], days_back: int = DAYS_BACK) -> bool:
     return False
 
 
+def is_remote_or_hybrid(location: str) -> bool:
+    """
+    Global filter: we only want remote or hybrid jobs.
+
+    - Keep anything whose location contains "remote" or "hybrid"
+    - Filter out purely on-site locations like "New York", "Amsterdam", etc.
+    """
+    if not location:
+        return False
+
+    loc = str(location).lower().strip()
+
+    if "remote" in loc:
+        return True
+    if "hybrid" in loc:
+        return True
+
+    return False
+
+
 def match_location(job_loc: str, pref: str) -> bool:
+    """
+    Per-subscriber location filter (runs *after* we already enforced remote/hybrid).
+
+    If subscriber has no preference -> accept.
+    Otherwise:
+      - allow "worldwide"/"anywhere"
+      - simple substring match of pref inside job_loc
+    """
     if not pref:
         return True
     job_loc = (job_loc or "").lower()
@@ -298,7 +326,8 @@ def build_html_digest(sub: Dict[str, Any], jobs: List[Dict[str, Any]]) -> str:
     for job in jobs:
         title = job.get("title") or "Untitled role"
         company = job.get("company") or ""
-        url = job.get("url") or "#"
+        # Prefer external/company apply URL if present
+        url = job.get("apply_url") or job.get("url") or "#"
         location = job.get("location") or "Remote"
 
         salary = ""
@@ -384,8 +413,12 @@ def main():
     header_to_col = {name: idx + 1 for idx, name in enumerate(header_row)}
     last_sent_col = header_to_col.get("last_sent_at")
 
-    recent_jobs = [j for j in jobs if job_is_recent(j)]
-    print(f"Recent jobs in window: {len(recent_jobs)}")
+    # Only consider recent AND remote/hybrid jobs
+    recent_jobs = [
+        j for j in jobs
+        if job_is_recent(j) and is_remote_or_hybrid(j.get("location", ""))
+    ]
+    print(f"Recent remote/hybrid jobs in window: {len(recent_jobs)}")
 
     for row_idx, sub in enumerate(subs, start=2):  # start=2 because row 1 is header
         email = sub.get("email")

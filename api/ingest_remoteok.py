@@ -2,8 +2,12 @@
 
 from http.server import BaseHTTPRequestHandler
 import json
+import logging
 
 from remoteok_ingest import ingest_remoteok
+
+logger = logging.getLogger("api.ingest_remoteok")
+logger.setLevel(logging.INFO)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -12,22 +16,25 @@ class handler(BaseHTTPRequestHandler):
         Vercel Python entrypoint for GET /api/ingest_remoteok
 
         - Calls ingest_remoteok()
-        - Returns JSON with how many jobs were ingested
+        - Returns JSON summary with how many jobs were ingested
         """
 
         try:
-            ingested_count = ingest_remoteok()
+            inserted = ingest_remoteok()
             status = 200
             payload = {
                 "status": "success",
                 "source": "remoteok",
-                "ingested": ingested_count,
+                "inserted": inserted,
+                "message": f"Ingested {inserted} new RemoteOK jobs",
             }
         except Exception as e:
+            logger.exception("Error in /api/ingest_remoteok: %s", e)
             status = 500
             payload = {
                 "status": "error",
                 "source": "remoteok",
+                "inserted": 0,
                 "message": str(e),
             }
 

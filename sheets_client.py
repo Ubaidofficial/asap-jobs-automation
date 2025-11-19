@@ -4,9 +4,12 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Your Google Sheet IDs
-JOBS_SHEET_ID = "1viyKdvfA5BN3g1gF8ZMWlTZmsafiXwOqNw6oVgkguJ0"
-SUBSCRIBERS_SHEET_ID = "1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g"
+# 👉 Correct mapping:
+# Jobs sheet:      1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g
+# Subscribers sheet: 1viyKdvfA5BN3g1gF8ZMWlTZmsafiXwOqNw6oVgkguJ0
+
+JOBS_SHEET_ID = "1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g"
+SUBSCRIBERS_SHEET_ID = "1viyKdvfA5BN3g1gF8ZMWlTZmsafiXwOqNw6oVgkguJ0"
 
 
 def get_gspread_client():

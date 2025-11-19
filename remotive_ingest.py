@@ -2,13 +2,14 @@
 """
 Fetch jobs from Remotive and store them in the Jobs Google Sheet.
 
-Source: Remotive public API (remote-only jobs) – https://remotive.com/api/remote-jobs
+Source: Remotive public API (remote-only jobs)
+  https://remotive.com/api/remote-jobs
 
 We map into the same Jobs sheet schema as RemoteOK:
     id, title, company, source, url, apply_url, source_job_id, location,
     job_roles, job_category, seniority, employment_type,
     tags, tech_stack, min_salary, max_salary, currency,
-    high_salary, posted_at, ingested_at
+    high_salary, posted_at, ingested_at, remote_scope
 
 We dedupe on (source, source_job_id).
 """
@@ -34,6 +35,7 @@ from remoteok_ingest import (
     extract_employment_type,
     is_high_salary,
     HIGH_SALARY_THRESHOLD,
+    compute_remote_scope,
 )
 
 load_dotenv()
@@ -44,38 +46,100 @@ logger.setLevel(logging.INFO)
 REMOTIVE_API_URL = os.environ.get("REMOTIVE_API_URL", "https://remotive.com/api/remote-jobs")
 
 
-def _is_remote_or_hybrid(location: str, job_type: str | None = None) -> bool:
+def _is_remote_or_hybrid(
+    location: str,
+    job_type: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+) -> bool:
     """
-    Extra safety filter: ensure we only keep remote or hybrid jobs.
-    Remotive is remote-first, but we still guard against weird edge cases.
+    Accept:
+    - Fully remote (worldwide / anywhere / remote)
+    - Remote but region/country-limited (e.g. "USA", "EMEA", "LATAM")
+    - Hybrid roles (where "hybrid" or "partly remote" appears)
+
+    Reject:
+    - Explicitly on-site only roles ("onsite only", "in-office only", "no remote", etc.)
     """
     loc = (location or "").lower()
     jt = (job_type or "").lower()
+    text = " ".join([
+        loc,
+        jt,
+        (title or "").lower(),
+        (description or "").lower(),
+    ])
 
-    # Very permissive, but keeps obvious remote configs
-    remote_keywords = [
+    # 1) Hard reject explicit on-site only signals
+    onsite_markers = [
+        "onsite only",
+        "on-site only",
+        "in office only",
+        "in-office only",
+        "no remote",
+        "not remote",
+        "must be on site",
+        "must be onsite",
+    ]
+    if any(p in text for p in onsite_markers):
+        return False
+
+    # 2) Accept if clearly remote
+    remote_markers = [
         "remote",
+        "work from home",
+        "work-from-home",
         "anywhere",
         "worldwide",
-        "work from home",
-        "from home",
-        "distributed",
+        "global",
+        "distributed team",
     ]
-    if any(k in loc for k in remote_keywords):
+    if any(p in text for p in remote_markers):
         return True
 
-    # Purely remote types
-    if jt in {"full_time", "part_time", "contract", "freelance", "internship"}:
-        # These are all remote in Remotive's context
+    # 3) Accept hybrid roles explicitly
+    hybrid_markers = [
+        "hybrid",
+        "partly remote",
+        "part-remote",
+    ]
+    if any(p in text for p in hybrid_markers):
         return True
 
+    # 4) Accept region/country-locked remote (Remotive context is remote-first)
+    region_markers = [
+        "usa",
+        "united states",
+        "canada",
+        "uk",
+        "united kingdom",
+        "europe",
+        "eu",
+        "emea",
+        "latam",
+        "apac",
+        "asia",
+        "australia",
+        "new zealand",
+        "south africa",
+        "brazil",
+        "mexico",
+        "argentina",
+        "colombia",
+        "india",
+        "philippines",
+    ]
+    if any(r in loc for r in region_markers):
+        return True
+
+    # If it's something weird like a pure city name with no remote/region context,
+    # be safe and drop it.
     return False
 
 
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Map a Remotive job JSON object to our Jobs sheet columns.
-    See Remotive API docs for field names. 
     """
     job_id = job.get("id")
     if not job_id:
@@ -90,9 +154,10 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
 
     location = job.get("candidate_required_location") or "Remote"
     job_type = job.get("job_type") or ""  # full_time / contract / part_time / freelance / internship
+    description = job.get("description") or ""
 
     # Filter to remote / hybrid only (extra safety)
-    if not _is_remote_or_hybrid(location, job_type):
+    if not _is_remote_or_hybrid(location, job_type, title, description):
         return None
 
     # Tags – Remotive gives a list of strings in "tags"
@@ -134,6 +199,8 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     seniority = extract_seniority(title, tags_list)
     employment_type = extract_employment_type(job_type, tags_list)
 
+    remote_scope = compute_remote_scope(location)
+
     row_dict: Dict[str, Any] = {
         "id": row_id,
         "title": title,
@@ -156,6 +223,7 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
         "high_salary": "TRUE" if high_salary_flag else "FALSE",
         "posted_at": posted_at,
         "ingested_at": ingested_at,
+        "remote_scope": remote_scope,
     }
 
     # Only keep keys present in sheet header

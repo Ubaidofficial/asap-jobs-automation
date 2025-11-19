@@ -7,7 +7,7 @@ Fetch jobs from RemoteOK and store them in the Jobs Google Sheet.
     id, title, company, source, url, apply_url, source_job_id, location,
     job_roles, job_category, seniority, employment_type,
     tags, tech_stack, min_salary, max_salary, currency,
-    high_salary, posted_at, ingested_at
+    high_salary, posted_at, ingested_at, remote_scope
 - Skips jobs that already exist (same source + source_job_id)
 """
 
@@ -93,6 +93,75 @@ def _parse_float(value: Any) -> Optional[float]:
         return float(str(value).replace(",", "").strip())
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------
+# Remote / hybrid scope helper
+# --------------------------------------------------------------------
+
+
+def compute_remote_scope(location: str) -> str:
+    """
+    Classify how 'broad' the remote access is based on location text.
+
+    Returns one of:
+    - "global"   -> worldwide / anywhere / global remote
+    - "regional" -> region-based (EMEA, LATAM, APAC, Europe, etc.)
+    - "country"  -> specific country-level (USA, Canada, UK, Germany, etc.)
+    - "unknown"  -> anything ambiguous or too specific (city-only, etc.)
+    """
+    loc = (location or "").strip()
+    if not loc:
+        return "unknown"
+
+    lower = loc.lower()
+
+    # Global
+    if any(k in lower for k in ["worldwide", "anywhere", "global"]):
+        return "global"
+    if lower in {"remote", "remote only"}:
+        return "global"
+
+    # Region-level markers
+    region_markers = [
+        "emea", "latam", "apac",
+        "europe", "asia", "africa",
+        "middle east", "south america",
+        "north america", "central america",
+        "cst +/-", "cet +/-", "gmt+",
+        "gmt-", "utc+", "utc-",
+    ]
+    if any(m in lower for m in region_markers):
+        return "regional"
+
+    # If location is a comma-separated list of countries / regions, treat as regional
+    if "," in loc:
+        return "regional"
+
+    # Country-level heuristics: single-token countries / well-known short codes
+    country_tokens = {
+        "usa", "us", "united states",
+        "canada", "uk", "united kingdom",
+        "germany", "france", "spain", "italy",
+        "poland", "netherlands", "belgium",
+        "sweden", "norway", "denmark", "finland",
+        "ireland", "switzerland", "australia",
+        "new zealand", "brazil", "mexico",
+        "argentina", "chile", "colombia",
+        "india", "pakistan", "bangladesh",
+        "philippines", "indonesia", "singapore",
+        "south africa", "nigeria", "kenya",
+        "japan", "south korea",
+    }
+    if lower in country_tokens:
+        return "country"
+
+    # If it looks like "Remote - USA" style
+    for c in country_tokens:
+        if c in lower:
+            return "country"
+
+    return "unknown"
 
 
 # --------------------------------------------------------------------
@@ -389,9 +458,8 @@ def fetch_apply_url(remoteok_url: str) -> str:
 
 def _ensure_headers(sheet) -> List[str]:
     """
-    Ensure header row exists and that 'apply_url' is present.
-    We DO NOT reorder existing columns; if 'apply_url' is missing,
-    it is appended at the end.
+    Ensure header row exists and that 'apply_url' and 'remote_scope' are present.
+    We DO NOT reorder existing columns; if missing, we append at the end.
     """
     headers = sheet.row_values(1)
     if not headers:
@@ -416,15 +484,29 @@ def _ensure_headers(sheet) -> List[str]:
             "high_salary",
             "posted_at",
             "ingested_at",
+            "remote_scope",
         ]
         sheet.insert_row(headers, 1)
         return headers
 
     existing = {h.strip() for h in headers if h}
+    updated = False
+
     if "apply_url" not in existing:
         headers.append("apply_url")
         sheet.update_cell(1, len(headers), "apply_url")
         logger.info("Added missing 'apply_url' column to Jobs sheet")
+        updated = True
+
+    if "remote_scope" not in existing:
+        headers.append("remote_scope")
+        sheet.update_cell(1, len(headers), "remote_scope")
+        logger.info("Added missing 'remote_scope' column to Jobs sheet")
+        updated = True
+
+    if updated:
+        # Re-read in case Google Sheets normalized anything
+        headers = sheet.row_values(1)
 
     return headers
 
@@ -481,6 +563,8 @@ def _normalize_remoteok_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     seniority = extract_seniority(title, tags_list)
     employment_type = extract_employment_type(title, tags_list)
 
+    remote_scope = compute_remote_scope(location)
+
     apply_url = fetch_apply_url(url) if url else ""
 
     row_dict: Dict[str, Any] = {
@@ -504,6 +588,7 @@ def _normalize_remoteok_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
         "high_salary": "TRUE" if high_salary_flag else "FALSE",
         "posted_at": posted_at,
         "ingested_at": ingested_at,
+        "remote_scope": remote_scope,
     }
 
     # Strip keys that aren't in headers (in case your sheet has a custom schema)
@@ -526,7 +611,6 @@ def ingest_remoteok() -> int:
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
-    header_index = {h: i for i, h in enumerate(headers)}  # noqa: F841
 
     # Existing jobs – dedupe by (source, source_job_id)
     existing_records = sheet.get_all_records()

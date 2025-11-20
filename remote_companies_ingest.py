@@ -11,6 +11,7 @@ Ingest jobs directly from remote-first companies' careers pages.
     high_salary, posted_at, ingested_at, remote_scope
 
 - Dedupe on (source, source_job_id)
+- Only inserts jobs where remote_scope ∈ {global, country, regional}
 """
 
 from __future__ import annotations
@@ -91,13 +92,15 @@ def _parse_greenhouse_board(
     """
     Parse a Greenhouse-hosted board (boards.greenhouse.io).
 
-    Greenhouse markup is quite consistent:
-    - Job links are within <a> tags under .opening or .opening a, or inside <div class="opening">
+    Typical markup:
+    <div class="opening">
+      <a href="/company/12345">Title</a>
+      <span class="location">Remote</span>
+    </div>
     """
     soup = BeautifulSoup(html, "html.parser")
     jobs: List[Dict[str, Any]] = []
 
-    # Classic pattern: <div class="opening"> <a href="/company/12345">Title</a> <span class="location">Remote</span>
     for div in soup.select("div.opening"):
         a = div.find("a", href=True)
         if not a:
@@ -107,7 +110,6 @@ def _parse_greenhouse_board(
         href = a["href"]
         url = urljoin(base_url, href)
 
-        # Often location is in span.location
         loc_el = div.find(class_="location")
         location = (loc_el.get_text() or "").strip() if loc_el else default_location
 
@@ -143,12 +145,13 @@ def _parse_lever_board(
     """
     Parse a Lever job board (jobs.lever.co).
 
-    Typical Lever markup:
-    - <div class="posting">
-        <a class="posting-title" href="/company/1234">...</a>
-        <div class="posting-categories">
-          <span class="sort-by-location">Remote</span>
-        </div>
+    Typical markup:
+    <div class="posting">
+      <a class="posting-title" href="/company/1234">...</a>
+      <div class="posting-categories">
+        <span class="sort-by-location">Remote</span>
+      </div>
+    </div>
     """
     soup = BeautifulSoup(html, "html.parser")
     jobs: List[Dict[str, Any]] = []
@@ -206,7 +209,7 @@ def _normalize_company_job(job: Dict[str, Any], headers: List[str]) -> Optional[
 
     location = job.get("location") or "Remote"
 
-    # classify remote scope; drop if ambiguous
+    # classify remote scope; drop if ambiguous / on-site / unknown
     remote_scope = compute_remote_scope(location)
     if remote_scope not in {"global", "country", "regional"}:
         return None
@@ -282,7 +285,7 @@ def ingest_remote_companies() -> int:
     headers = _ensure_headers(sheet)
 
     # Dedupe set: (source, source_job_id)
-    existing_records = sheet.get_all_records()
+    existing_records = sheet.get_all_records(expected_headers=headers)
     existing_keys: Set[str] = set()
     for row in existing_records:
         source = _normalize_text(row.get("source"))
@@ -290,7 +293,10 @@ def ingest_remote_companies() -> int:
         if source and sid:
             existing_keys.add(f"{source}:{sid}")
 
-    logger.info("Loaded %d existing rows from Jobs sheet (for RemoteCompanies ingest)", len(existing_records))
+    logger.info(
+        "Loaded %d existing rows from Jobs sheet (for RemoteCompanies ingest)",
+        len(existing_records),
+    )
 
     total_inserted = 0
     all_new_rows: List[List[Any]] = []

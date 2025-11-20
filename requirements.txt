@@ -1,5 +1,5 @@
+requests
+beautifulsoup4
 gspread==6.0.2
 google-auth==2.29.0
-requests
 python-dotenv
-beautifulsoup4

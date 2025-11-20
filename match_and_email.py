@@ -5,6 +5,7 @@ Match jobs to subscribers based on preferences and build personalized HTML diges
 Current behaviour (enhanced):
 - Reads recent jobs from Jobs sheet (last DAYS_BACK days)
 - Reads Subscribers sheet
+- Uses a SentJobs sheet to avoid re-sending the same job to the same subscriber
 - For each subscriber:
     - Checks if it's time to send (based on frequency + last_sent_at)
     - Filters jobs by:
@@ -17,17 +18,18 @@ Current behaviour (enhanced):
         - tech/language prefs
         - company prefs
         - free-text search term
+        - NOT already sent to this subscriber (SentJobs sheet)
     - Dedupes jobs across sources using a fingerprint
-    - Scores and picks top N
+    - Scores jobs and picks top N (based on frequency)
+    - Ensures basic company diversity (max 3 jobs per company)
     - Builds an HTML digest (uses apply_url as primary link)
     - DRY-RUN: prints a message instead of sending real email
     - Updates last_sent_at in the Subscribers sheet
-
-Once you’re happy with the matches, you can plug in a real Beehiiv (or other ESP)
-send function inside send_email_via_beehiiv().
+    - Appends (email, job_id, sent_at) rows into SentJobs sheet
 """
 
 import os
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 
@@ -42,8 +44,8 @@ load_dotenv()
 # Jobs window: consider jobs from the last N days
 DAYS_BACK = int(os.environ.get("MATCH_DAYS_BACK", "2"))
 
-# Maximum number of jobs per subscriber digest
-TOP_N_JOBS = int(os.environ.get("TOP_N_JOBS", "10"))
+# Maximum hard cap of jobs per subscriber digest
+TOP_N_JOBS = int(os.environ.get("TOP_N_JOBS", "20"))
 
 
 # ---------- General helpers ----------
@@ -156,6 +158,22 @@ def is_due_to_send(sub: Dict[str, Any]) -> bool:
 
     # fallback (shouldn't hit because of _normalize_freq)
     return days >= 1
+
+
+def jobs_per_digest(sub: Dict[str, Any]) -> int:
+    """
+    Decide how many jobs to send based on frequency, with a global hard cap.
+    """
+    freq = _normalize_freq(sub.get("frequency") or "")
+    if freq == "daily":
+        target = 7
+    elif freq == "twice_weekly":
+        target = 12
+    elif freq == "weekly":
+        target = 18
+    else:
+        target = 7
+    return min(target, TOP_N_JOBS)
 
 
 # ---------- Canonical roles / expansion ----------
@@ -579,6 +597,10 @@ def match_search_term(job: Dict[str, Any], term: str) -> bool:
 
 
 def score_job(job: Dict[str, Any], sub: Dict[str, Any]) -> int:
+    """
+    Simple additive scoring. Filters already ensure "hard fit"; this ranks the
+    remaining jobs for this subscriber.
+    """
     score = 0
 
     if match_roles(job.get("job_roles", ""), sub.get("job_roles", "")):
@@ -609,6 +631,10 @@ def score_job(job: Dict[str, Any], sub: Dict[str, Any]) -> int:
     if scope == "global":
         score += 1
 
+    # small boost for Remote-first companies
+    if (job.get("source") or "").lower() == "remotecompanies":
+        score += 1
+
     return score
 
 
@@ -635,7 +661,37 @@ def format_salary_range(job: Dict[str, Any]) -> str:
     return ""
 
 
+# ---------- SentJobs sheet helpers ----------
+
+def get_or_create_sent_jobs_sheet(subs_sheet):
+    """
+    Sent jobs history lives in the same spreadsheet as Subscribers, in a tab:
+      - title: "SentJobs"
+      - columns: email, job_id, sent_at
+    """
+    sh = subs_sheet.spreadsheet
+    try:
+        ws = sh.worksheet("SentJobs")
+    except Exception:
+        ws = sh.add_worksheet(title="SentJobs", rows=1000, cols=3)
+        ws.insert_row(["email", "job_id", "sent_at"], 1)
+    return ws
+
+
 # ---------- HTML digest ----------
+
+def build_subject_line(sub: Dict[str, Any], job_count: int) -> str:
+    """
+    Simple personalized subject line using first_name + primary role.
+    """
+    first_name = (sub.get("first_name") or "").strip()
+    roles_raw = sub.get("job_roles") or ""
+    roles_list = parse_csv(roles_raw)
+    primary_role = roles_list[0].title() if roles_list else "remote roles"
+
+    name_prefix = f"{first_name}, " if first_name else ""
+    return f"{name_prefix}{job_count} new {primary_role} from ASAP Jobs"
+
 
 def build_html_digest(sub: Dict[str, Any], jobs: List[Dict[str, Any]]) -> str:
     fname = sub.get("first_name") or "there"
@@ -770,10 +826,20 @@ def main():
     print("[MATCH] Starting ASAP Jobs matching run...")
     jobs_sheet = get_jobs_sheet()
     subs_sheet = get_subscribers_sheet()
+    sent_sheet = get_or_create_sent_jobs_sheet(subs_sheet)
 
     # Read all rows as list[dict]
     jobs = jobs_sheet.get_all_records()
     subs = subs_sheet.get_all_records()
+
+    # Load SentJobs history
+    sent_records = sent_sheet.get_all_records()
+    sent_by_email: Dict[str, Set[str]] = defaultdict(set)
+    for row in sent_records:
+        email = (row.get("email") or "").strip().lower()
+        jid = (str(row.get("job_id") or "")).strip()
+        if email and jid:
+            sent_by_email[email].add(jid)
 
     # For updating last_sent_at we need column index
     header_row = subs_sheet.row_values(1)
@@ -788,12 +854,15 @@ def main():
     print(f"[MATCH] Remote/hybrid-eligible jobs after remote_scope filter: {len(remote_jobs)}")
 
     for row_idx, sub in enumerate(subs, start=2):  # start=2 because row 1 is header
-        email = sub.get("email")
+        email = (sub.get("email") or "").strip()
         if not email:
             continue
 
         if not is_due_to_send(sub):
             continue
+
+        email_key = email.lower()
+        already_sent_ids = sent_by_email.get(email_key, set())
 
         print(f"[MATCH] Evaluating subscriber: {email}")
         matched: List[Tuple[int, Dict[str, Any]]] = []
@@ -801,6 +870,11 @@ def main():
         high_salary_only = bool_from_str(sub.get("high_salary_only"))
 
         for job in remote_jobs:
+            # skip jobs already sent to this subscriber
+            job_id = (str(job.get("id") or "")).strip()
+            if job_id and job_id in already_sent_ids:
+                continue
+
             # cross-source dedupe based on fingerprint
             fp = compute_job_fingerprint(job)
             if fp in seen_fingerprints:
@@ -835,14 +909,51 @@ def main():
             print(f"[MATCH] No matches for {email}")
             continue
 
+        # Sort by score (desc)
         matched.sort(key=lambda x: x[0], reverse=True)
-        top_jobs = [j for _, j in matched[:TOP_N_JOBS]]
-        print(f"[MATCH] Subscriber {email} -> {len(top_jobs)} jobs selected")
 
-        html = build_html_digest(sub, top_jobs)
-        subject = "Your ASAP Jobs remote opportunities"
+        # Company diversity + per-frequency job count
+        target_n = jobs_per_digest(sub)
+        selected_jobs: List[Dict[str, Any]] = []
+        company_counts: Dict[str, int] = {}
+
+        for score_val, job in matched:
+            company_key = (job.get("company") or "").strip().lower()
+            count = company_counts.get(company_key, 0)
+
+            # Max 3 roles per company per email
+            if count >= 3:
+                continue
+
+            selected_jobs.append(job)
+            company_counts[company_key] = count + 1
+
+            if len(selected_jobs) >= target_n:
+                break
+
+        if not selected_jobs:
+            print(f"[MATCH] No jobs selected after diversity capping for {email}")
+            continue
+
+        print(f"[MATCH] Subscriber {email} -> {len(selected_jobs)} jobs selected")
+
+        html = build_html_digest(sub, selected_jobs)
+        subject = build_subject_line(sub, len(selected_jobs))
 
         send_email_via_beehiiv(email, subject, html)
+
+        # Record sent jobs in SentJobs sheet
+        rows_to_append = [
+            [email, (job.get("id") or ""), iso_now()]
+            for job in selected_jobs
+        ]
+        if rows_to_append:
+            sent_sheet.append_rows(rows_to_append, value_input_option="RAW")
+            # update in-memory cache too
+            for r in rows_to_append:
+                jid = (str(r[1]) or "").strip()
+                if jid:
+                    sent_by_email[email_key].add(jid)
 
         # Update last_sent_at if column exists
         if last_sent_col:

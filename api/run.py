@@ -10,17 +10,24 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """
         GET /api/run -> same as /api/match for now.
+
+        Runs the ASAP Jobs matching + digest generation (DRY-RUN send).
         """
 
         try:
+            print("[API] /api/run called – starting automation run")
             main()
             status = 200
             payload = {
                 "status": "success",
-                "message": "ASAP Jobs automation ran successfully",
+                "message": "ASAP Jobs automation run completed successfully",
             }
+            print("[API] /api/run completed successfully")
+
         except Exception as e:
             traceback.print_exc()
+            print(f"[API] /api/run error: {e}")
+
             status = 500
             payload = {
                 "status": "error",

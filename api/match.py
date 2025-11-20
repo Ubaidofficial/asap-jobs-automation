@@ -11,7 +11,7 @@ class handler(BaseHTTPRequestHandler):
         """
         Vercel Python Serverless Function entrypoint.
 
-        GET /api/match -> runs the matching+email logic (currently DRY-RUN).
+        GET /api/match -> runs the ASAP Jobs matching + digest generation (DRY-RUN send).
         """
 
         try:
@@ -21,7 +21,7 @@ class handler(BaseHTTPRequestHandler):
             payload = {
                 "status": "success",
                 "source": "match",
-                "message": "ASAP Jobs matching ran successfully",
+                "message": "ASAP Jobs matching run completed successfully",
             }
             print("[API] /api/match completed successfully")
         except Exception as e:

@@ -638,7 +638,8 @@ def ingest_remoteok() -> int:
     headers = _ensure_headers(sheet)
 
     # Existing jobs – dedupe by (source, source_job_id)
-    existing_records = sheet.get_all_records()
+    # IMPORTANT: use expected_headers to avoid "header row not unique" error.
+    existing_records = sheet.get_all_records(expected_headers=headers)
     existing_keys: Set[str] = set()
     for row in existing_records:
         source = _normalize_text(row.get("source"))

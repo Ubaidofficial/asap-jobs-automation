@@ -1,112 +1,627 @@
 # nodesk_ingest.py
 """
-Fetch jobs from NoDesk and store them in the Jobs Google Sheet.
+Fetch remote-first jobs from NoDesk and store them in the Jobs Google Sheet.
 
-We scrape the public jobs list (best-effort HTML parsing).
+- Scrapes the main remote jobs page (remote-first jobs):
+    Default: https://nodesk.co/remote-jobs/remote-first/
+    (You can override with NODESK_JOBS_URL env var, e.g. https://nodesk.co/remote-jobs/)
 
-We map into the same Jobs sheet schema:
+- Maps fields into your Jobs sheet columns:
     id, title, company, source, url, apply_url, source_job_id, location,
     job_roles, job_category, seniority, employment_type,
     tags, tech_stack, min_salary, max_salary, currency,
     high_salary, posted_at, ingested_at, remote_scope
 
-We dedupe on (source, source_job_id) and only insert jobs where
-remote_scope ∈ {global, country, regional}.
+- Skips jobs that already exist (same source + source_job_id)
+- Filters to clearly remote jobs by using remote_scope:
+    only rows with remote_scope ∈ {global, country, regional} are inserted.
 """
 
-from __future__ import annotations
-
+import os
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from sheets_client import get_jobs_sheet
-from remoteok_ingest import (
-    _ensure_headers,
-    _normalize_text,
-    _to_str,
-    extract_tech_stack,
-    normalize_role,
-    normalize_category,
-    extract_seniority,
-    extract_employment_type,
-    is_high_salary,
-    HIGH_SALARY_THRESHOLD,
-    compute_remote_scope,
-)
 
 load_dotenv()
 
 logger = logging.getLogger("nodesk_ingest")
 logger.setLevel(logging.INFO)
 
-NODESK_URL = "https://nodesk.co/remote-jobs/"
-USER_AGENT = "ASAPJobsBot/1.0 (contact: youremail@example.com)"
+NODESK_JOBS_URL = os.environ.get(
+    "NODESK_JOBS_URL",
+    # This is the main "Remote-First Jobs" page.
+    "https://nodesk.co/remote-jobs/remote-first/",
+)
+
+HIGH_SALARY_THRESHOLD = int(os.environ.get("HIGH_SALARY_THRESHOLD", "150000"))
+
+# --------------------------------------------------------------------
+# Shared helpers (same style as remoteok/remotive)
+# --------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _to_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return str(value)
 
 
-def _fetch_html(url: str) -> Optional[str]:
+def _normalize_text(s: Optional[str]) -> str:
+    return (s or "").strip()
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
     try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=25,
-        )
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        logger.warning("Failed to fetch %s: %s", url, e)
+        return float(str(value).replace(",", "").strip())
+    except Exception:
         return None
 
 
-def _normalize_nodesk_job(job: Dict[str, Any], headers: List[str]) -> Optional[Dict[str, Any]]:
+def _tags_to_list(tags: Any) -> List[str]:
+    if tags is None:
+        return []
+    if isinstance(tags, list):
+        return [str(t).strip() for t in tags if str(t).strip()]
+    if isinstance(tags, str):
+        return [t.strip() for t in tags.split(",") if t.strip()]
+    return [str(tags).strip()]
+
+
+# Known tech keywords (lowercased)
+KNOWN_TECH_KEYWORDS = {
+    # languages
+    "python", "java", "javascript", "typescript", "go", "golang", "ruby", "php",
+    "c", "c++", "c#", "scala", "rust", "kotlin", "swift",
+
+    # frameworks / libs
+    "django", "flask", "fastapi", "spring", "rails", "laravel",
+    "react", "reactjs", "react.js", "nextjs", "next.js", "vue", "vuejs",
+    "angular", "svelte", "sveltekit", "nuxt", "nuxtjs",
+
+    # data / ml
+    "sql", "postgres", "postgresql", "mysql", "mongodb", "redis", "elasticsearch",
+    "kafka", "spark", "hadoop", "airflow", "dbt", "pandas", "numpy", "pytorch",
+    "tensorflow", "sklearn", "scikit-learn", "bigquery", "snowflake", "redshift",
+
+    # devops / infra
+    "aws", "gcp", "azure", "docker", "kubernetes", "k8s",
+    "terraform", "ansible", "jenkins", "github actions", "gitlab ci",
+
+    # tooling & design
+    "git", "linux",
+    "figma", "photoshop", "illustrator", "adobe xd",
+}
+
+
+def compute_remote_scope(location: str) -> str:
     """
-    Expected keys:
-      - title
-      - company
-      - url
-      - location  (e.g. "Remote - US", "Remote - Europe", "Remote - Worldwide")
+    Classify how 'broad' the remote access is based on location text.
+
+    Returns one of:
+    - "global"   -> worldwide / anywhere / global remote
+    - "regional" -> region-based (EMEA, LATAM, APAC, Europe, etc.)
+    - "country"  -> specific country-level (USA, Canada, UK, Germany, etc.)
+    - "onsite"   -> explicitly non-remote/office-only
+    - "unknown"  -> anything ambiguous or too specific (city-only, etc.)
     """
-    title = job.get("title") or ""
-    company = job.get("company") or ""
-    url = job.get("url") or ""
-    location = job.get("location") or "Remote"
+    loc = (location or "").strip()
+    if not loc:
+        return "unknown"
+
+    lower = loc.lower()
+
+    # Onsite / office-only markers
+    onsite_markers = [
+        "onsite only",
+        "on-site only",
+        "onsite",
+        "on-site",
+        "in office",
+        "in-office",
+        "no remote",
+        "not remote",
+        "office-based",
+    ]
+    if any(m in lower for m in onsite_markers):
+        return "onsite"
+
+    # Global
+    if any(k in lower for k in ["worldwide", "world wide", "anywhere", "global"]):
+        return "global"
+    if lower in {"remote", "remote only"}:
+        return "global"
+
+    # Region-level markers
+    region_markers = [
+        "emea", "latam", "apac",
+        "europe", "asia", "africa",
+        "middle east", "south america",
+        "north america", "central america",
+        "cst +/-", "cet +/-", "gmt+",
+        "gmt-", "utc+", "utc-",
+    ]
+    if any(m in lower for m in region_markers):
+        return "regional"
+
+    # If location is a comma-separated list of countries / regions, treat as regional
+    if "," in loc:
+        return "regional"
+
+    # Country-level heuristics: single-token countries / well-known short codes
+    country_tokens = {
+        "usa", "us", "united states",
+        "canada", "uk", "united kingdom",
+        "germany", "france", "spain", "italy",
+        "poland", "netherlands", "belgium",
+        "sweden", "norway", "denmark", "finland",
+        "ireland", "switzerland", "australia",
+        "new zealand", "brazil", "mexico",
+        "argentina", "chile", "colombia",
+        "india", "pakistan", "bangladesh",
+        "philippines", "indonesia", "singapore",
+        "south africa", "nigeria", "kenya",
+        "japan", "south korea",
+    }
+    if lower in country_tokens:
+        return "country"
+
+    for c in country_tokens:
+        if c in lower:
+            return "country"
+
+    return "unknown"
+
+
+def normalize_role(title: str, tags: Any) -> str:
+    """
+    Map messy titles/tags to a small controlled set of canonical roles.
+    Same mapping as remoteok_ingest.
+    """
+    text = f"{title} {' '.join(_tags_to_list(tags))}".lower()
+
+    role_patterns = [
+        ("Data Scientist", ["data scientist"]),
+        ("Machine Learning Engineer", ["ml engineer", "machine learning engineer"]),
+        ("Data Engineer", ["data engineer"]),
+        ("Data Analyst", ["data analyst", "analytics engineer"]),
+
+        ("DevOps Engineer", ["devops", "site reliability", "sre"]),
+        ("Backend Engineer", ["backend engineer", "back-end engineer", "backend developer", "server engineer"]),
+        ("Frontend Engineer", ["frontend engineer", "front-end engineer", "frontend developer", "front end developer", "ui engineer"]),
+        ("Full-Stack Engineer", ["fullstack", "full-stack", "full stack"]),
+        ("Mobile Engineer", ["mobile engineer", "mobile developer", "ios engineer", "android engineer"]),
+        ("Software Engineer", ["software engineer", "software developer", "swe"]),
+
+        ("Product Manager", ["product manager", "product owner"]),
+        ("Product Designer", ["product designer"]),
+        ("UX/UI Designer", ["ux designer", "ui designer", "ux/ui", "ux ui"]),
+
+        ("Marketing Manager", ["marketing manager", "digital marketing manager"]),
+        ("Growth Marketer", ["growth marketer", "growth marketing"]),
+        ("Content Marketer", ["content marketer", "content marketing", "copywriter", "copy writer"]),
+
+        ("Sales Representative", ["sales development", "sdr", "sales representative"]),
+        ("Account Executive", ["account executive", "ae"]),
+        ("Customer Success Manager", ["customer success", "cs manager"]),
+        ("Support Specialist", ["customer support", "support specialist", "technical support", "helpdesk", "help desk"]),
+
+        ("Recruiter", ["recruiter", "talent acquisition"]),
+        ("HR Generalist", ["hr generalist"]),
+        ("People Operations", ["people ops", "people operations"]),
+
+        ("Operations Manager", ["operations manager", "ops manager", "business operations"]),
+        ("Project Manager", ["project manager", "program manager"]),
+
+        ("Finance Manager", ["finance manager", "fp&a", "financial analyst"]),
+        ("Accountant", ["accountant"]),
+
+        ("Legal Counsel", ["legal counsel", "attorney", "lawyer"]),
+
+        ("Founder / CEO", ["founder", "co-founder", "ceo"]),
+        ("CTO", ["cto", "chief technology officer"]),
+        ("COO", ["coo", "chief operating officer"]),
+        ("CPO", ["cpo", "chief product officer"]),
+
+        ("Intern", ["intern", "internship"]),
+    ]
+
+    for canonical, patterns in role_patterns:
+        for p in patterns:
+            if p in text:
+                return canonical
+
+    return "Other"
+
+
+def normalize_category(title: str, tags: Any, role: Optional[str] = None) -> str:
+    """
+    Map each job into a broad category from a controlled set.
+    """
+    if not role:
+        role = normalize_role(title, tags)
+
+    role_to_category = {
+        # Engineering / Tech
+        "Software Engineer": "Engineering",
+        "Backend Engineer": "Engineering",
+        "Frontend Engineer": "Engineering",
+        "Full-Stack Engineer": "Engineering",
+        "Mobile Engineer": "Engineering",
+        "DevOps Engineer": "Engineering",
+
+        # Data
+        "Data Engineer": "Data",
+        "Data Scientist": "Data",
+        "Data Analyst": "Data",
+        "Machine Learning Engineer": "Data",
+
+        # Product / Design
+        "Product Manager": "Product",
+        "Product Designer": "Design",
+        "UX/UI Designer": "Design",
+
+        # GTM
+        "Marketing Manager": "Marketing",
+        "Growth Marketer": "Marketing",
+        "Content Marketer": "Marketing",
+        "Sales Representative": "Sales",
+        "Account Executive": "Sales",
+        "Customer Success Manager": "Customer Support",
+        "Support Specialist": "Customer Support",
+
+        # People / Ops
+        "Recruiter": "People/HR",
+        "HR Generalist": "People/HR",
+        "People Operations": "People/HR",
+        "Operations Manager": "Operations",
+        "Project Manager": "Operations",
+
+        # G&A
+        "Finance Manager": "Finance",
+        "Accountant": "Finance",
+        "Legal Counsel": "Legal",
+
+        # Leadership / Intern
+        "Founder / CEO": "Leadership",
+        "CTO": "Leadership",
+        "COO": "Leadership",
+        "CPO": "Leadership",
+        "Intern": "Internship",
+    }
+
+    if role in role_to_category:
+        return role_to_category[role]
+
+    text = f"{title} {' '.join(_tags_to_list(tags))}".lower()
+
+    keyword_category = [
+        ("Engineering", ["engineer", "developer", "devops", "sre"]),
+        ("Data", ["data", "analytics", "machine learning", "ml"]),
+        ("Design", ["designer", "ux", "ui"]),
+        ("Product", ["product manager", "product owner"]),
+        ("Marketing", ["marketing", "growth", "demand gen", "performance marketing"]),
+        ("Sales", ["sales", "account executive", "sdr", "bdr"]),
+        ("Customer Support", ["customer support", "support specialist", "customer success"]),
+        ("People/HR", ["recruiter", "talent", "hr", "people ops"]),
+        ("Operations", ["operations", "ops manager", "program manager"]),
+        ("Finance", ["finance", "accountant", "fp&a"]),
+        ("Legal", ["legal", "counsel", "attorney"]),
+        ("Leadership", ["head of", "vp", "vice president", "chief", "c-level", "cxo"]),
+        ("Internship", ["intern", "internship"]),
+    ]
+
+    for cat, patterns in keyword_category:
+        for p in patterns:
+            if p in text:
+                return cat
+
+    return "Other"
+
+
+def extract_seniority(title: str, tags: Any) -> str:
+    text = f"{title} {' '.join(_tags_to_list(tags))}".lower()
+
+    if any(k in text for k in ["vp ", "vp,", "vice president", "chief ", " cto", " cfo", " ceo", "coo", "cxo"]):
+        return "VP/C-level"
+    if "head of" in text:
+        return "Director"
+    if "director" in text:
+        return "Director"
+    if "principal" in text:
+        return "Principal"
+    if "staff" in text:
+        return "Staff"
+    if "lead" in text:
+        return "Lead"
+    if "senior" in text or " sr " in text or " sr." in text or "sr " in text:
+        return "Senior"
+    if "junior" in text or " jr " in text or " jr." in text:
+        return "Junior"
+    if "intern" in text or "internship" in text:
+        return "Intern"
+
+    return "Mid"
+
+
+def extract_employment_type(title: str, tags: Any) -> str:
+    text = f"{title} {' '.join(_tags_to_list(tags))}".lower()
+
+    if "intern" in text or "internship" in text:
+        return "Internship"
+    if "part-time" in text or "part time" in text or "parttime" in text:
+        return "Part-time"
+    if "freelance" in text or "freelancer" in text:
+        return "Freelance"
+    if "contract" in text or "contractor" in text:
+        return "Contract"
+    if "temporary" in text or "temp " in text:
+        return "Temporary"
+    if "full-time" in text or "full time" in text or "fulltime" in text or "permanent" in text:
+        return "Full-time"
+
+    return "Full-time"
+
+
+def extract_tech_stack(tags: Any) -> List[str]:
+    techs: List[str] = []
+    seen: Set[str] = set()
+
+    for raw_tag in _tags_to_list(tags):
+        tag = raw_tag.strip()
+        lower = tag.lower()
+        normalized = lower
+
+        if lower in KNOWN_TECH_KEYWORDS:
+            if normalized not in seen:
+                techs.append(tag)
+                seen.add(normalized)
+            continue
+
+        if any(ch in tag for ch in ["#", "+", ".NET", ".net"]):
+            if normalized not in seen:
+                techs.append(tag)
+                seen.add(normalized)
+            continue
+
+    return techs
+
+
+def is_high_salary(
+    min_salary: Optional[float],
+    max_salary: Optional[float],
+    currency: Optional[str],
+    threshold: int = HIGH_SALARY_THRESHOLD,
+) -> bool:
+    if max_salary is None:
+        return False
+    try:
+        return float(max_salary) >= float(threshold)
+    except (ValueError, TypeError):
+        return False
+
+
+# --------------------------------------------------------------------
+# Sheet helpers
+# --------------------------------------------------------------------
+
+
+def _ensure_headers(sheet) -> List[str]:
+    """
+    Ensure header row exists and that 'apply_url' and 'remote_scope' are present.
+    We DO NOT reorder existing columns; if missing, we append at the end.
+    """
+    headers = sheet.row_values(1)
+    if not headers:
+        headers = [
+            "id",
+            "title",
+            "company",
+            "source",
+            "url",
+            "apply_url",
+            "source_job_id",
+            "location",
+            "job_roles",
+            "job_category",
+            "seniority",
+            "employment_type",
+            "tags",
+            "tech_stack",
+            "min_salary",
+            "max_salary",
+            "currency",
+            "high_salary",
+            "posted_at",
+            "ingested_at",
+            "remote_scope",
+        ]
+        sheet.insert_row(headers, 1)
+        return headers
+
+    existing = {h.strip() for h in headers if h}
+    updated = False
+
+    if "apply_url" not in existing:
+        headers.append("apply_url")
+        sheet.update_cell(1, len(headers), "apply_url")
+        logger.info("Added missing 'apply_url' column to Jobs sheet")
+        updated = True
+
+    if "remote_scope" not in existing:
+        headers.append("remote_scope")
+        sheet.update_cell(1, len(headers), "remote_scope")
+        logger.info("Added missing 'remote_scope' column to Jobs sheet")
+        updated = True
+
+    if updated:
+        headers = sheet.row_values(1)
+
+    return headers
+
+
+# --------------------------------------------------------------------
+# NoDesk-specific parsing
+# --------------------------------------------------------------------
+
+
+def _extract_source_job_id(url: str) -> str:
+    """
+    Use the last path segment of the job URL as a stable source_job_id.
+    """
+    try:
+        path = urlparse(url).path.rstrip("/")
+        slug = path.split("/")[-1]
+        return slug or path or url
+    except Exception:
+        return url
+
+
+def _normalize_nodesk_job(h2_tag, headers: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Convert one NoDesk job block (starting at an <h2>) into a row dict.
+
+    We keep parsing simple and robust:
+    - title from <h2><a>
+    - company from the first following <h3>
+    - location from the 'Remote:' line + its following element (e.g. 'Worldwide')
+    - tags are minimal (category + employment type text if available)
+    - salary and posted_at left empty for now (NoDesk shows relative times)
+    """
+    a = h2_tag.find("a", href=True)
+    if not a:
+        return None
+
+    href = a["href"]
+    if not href:
+        return None
+
+    url = href
+    if not url.startswith("http"):
+        url = urljoin("https://nodesk.co", url)
+
+    # Only keep real job detail pages, not collections or ads
+    if "/remote-jobs/collections" in url:
+        return None
+    if "/remote-jobs/" not in url:
+        return None
+
+    title = a.get_text(strip=True)
+    if not title:
+        return None
+
+    container = h2_tag.parent
+
+    # Company is usually the next <h3>
+    company_tag = container.find("h3")
+    company = company_tag.get_text(strip=True) if company_tag else ""
+
+    # Find Remote: <something>
+    location = "Remote"
+    remote_location = ""
+
+    remote_label = None
+    for tag in container.find_all(["h4", "p", "span"]):
+        text = (tag.get_text() or "").strip()
+        if text.lower().startswith("remote:"):
+            remote_label = tag
+            break
+
+    if remote_label:
+        # The next element that isn't just "Remote:" is the location, e.g. "Worldwide"
+        loc_tag = remote_label.find_next()
+        # Skip the Remote: label itself
+        while loc_tag and (loc_tag == remote_label or not loc_tag.get_text(strip=True)):
+            loc_tag = loc_tag.find_next()
+        if loc_tag:
+            remote_location = loc_tag.get_text(strip=True)
+
+    if remote_location:
+        # e.g. "Worldwide", "UTC-7 to UTC+1", "Europe", etc.
+        if "remote" in remote_location.lower():
+            location = remote_location
+        else:
+            location = f"Remote - {remote_location}"
+    else:
+        location = "Remote"
 
     remote_scope = compute_remote_scope(location)
     if remote_scope not in {"global", "country", "regional"}:
+        # We only ingest clearly remote jobs
         return None
 
-    path_part = url.split("?")[0].rstrip("/").split("/")[-1] if url else title
-    source_job_id = _to_str(path_part)
-    row_id = f"nodesk_{source_job_id}"
+    # Minimal tags: job category + employment type text if we can find them
+    category_text = ""
+    emp_text = ""
 
-    tags_list: List[str] = []
-    tags_str = ", ".join(tags_list)
-    tech_stack_list = extract_tech_stack(tags_list)
+    # After the location, we usually have:
+    # - Category (e.g. "Sales", "Engineering")
+    # - Employment type ("Full-Time", "Part-Time", "Contract", etc.)
+    # We'll try to read the next two "heading-ish" elements.
+    heading_tags = []
+    for tag in container.find_all(["h4", "h5"]):
+        heading_tags.append(tag)
+
+    # Try to locate indices relative to remote_label
+    if remote_label and heading_tags:
+        try:
+            idx = heading_tags.index(remote_label)
+        except ValueError:
+            idx = -1
+
+        # Next heading-ish tag after 'Remote:'
+        if 0 <= idx + 1 < len(heading_tags):
+            category_text = heading_tags[idx + 1].get_text(strip=True)
+        # Next one after that is often employment type
+        if 0 <= idx + 2 < len(heading_tags):
+            emp_text = heading_tags[idx + 2].get_text(strip=True)
+
+    extra_tags: List[str] = []
+    if category_text:
+        extra_tags.append(category_text)
+    if emp_text:
+        extra_tags.append(emp_text)
+
+    tags_str = ", ".join(extra_tags)
+    tech_stack_list = extract_tech_stack(extra_tags)
     tech_stack_str = ", ".join(tech_stack_list)
 
-    role = normalize_role(title, tags_list)
-    category = normalize_category(title, tags_list, role)
-    seniority = extract_seniority(title, tags_list)
-    employment_type = extract_employment_type(title, tags_list)
+    # Role/category/seniority/employment_type via shared helpers
+    role = normalize_role(title, extra_tags)
+    category = normalize_category(title, extra_tags, role)
+    seniority = extract_seniority(title, extra_tags)
 
-    min_salary_num: Optional[float] = None
-    max_salary_num: Optional[float] = None
-    currency = "USD"
-    min_salary = ""
-    max_salary = ""
-    high_salary_flag = is_high_salary(min_salary_num, max_salary_num, currency, threshold=HIGH_SALARY_THRESHOLD)
+    employment_type = ""
+    if emp_text:
+        employment_type = extract_employment_type(title, [emp_text])
+    else:
+        employment_type = extract_employment_type(title, extra_tags)
 
-    posted_at = ""  # could be parsed later if exposed in markup
-    ingested_at = _now_iso()
+    # Salary & currency – NoDesk shows "$80K – $100K" etc but we keep it simple for now.
+    min_salary_num = None
+    max_salary_num = None
+    currency = ""
+
+    min_salary = "" if min_salary_num is None else min_salary_num
+    max_salary = "" if max_salary_num is None else max_salary_num
+    high_salary_flag = is_high_salary(min_salary_num, max_salary_num, currency or "USD")
+
+    # Posted date – NoDesk shows relative like "1d", "3d"
+    posted_at = ""
+    ingested_at = datetime.now(timezone.utc).isoformat()
+
+    source_job_id = _extract_source_job_id(url)
+    row_id = f"nodesk_{source_job_id}"
 
     row_dict: Dict[str, Any] = {
         "id": row_id,
@@ -114,7 +629,7 @@ def _normalize_nodesk_job(job: Dict[str, Any], headers: List[str]) -> Optional[D
         "company": company,
         "source": "NoDesk",
         "url": url,
-        "apply_url": url,
+        "apply_url": url,  # we send users to the NoDesk job page; they can apply from there
         "source_job_id": source_job_id,
         "location": location,
         "job_roles": role,
@@ -132,7 +647,7 @@ def _normalize_nodesk_job(job: Dict[str, Any], headers: List[str]) -> Optional[D
         "remote_scope": remote_scope,
     }
 
-    # Strip keys that don't exist in the sheet
+    # Keep only known headers
     for key in list(row_dict.keys()):
         if key not in headers:
             row_dict.pop(key, None)
@@ -140,94 +655,91 @@ def _normalize_nodesk_job(job: Dict[str, Any], headers: List[str]) -> Optional[D
     return row_dict
 
 
+# --------------------------------------------------------------------
+# Main ingestion pipeline
+# --------------------------------------------------------------------
+
+
 def ingest_nodesk() -> int:
     """
-    Fetch NoDesk jobs and append new ones to the Jobs sheet.
-    Returns number of rows inserted.
+    Fetch NoDesk remote-first jobs and append new ones to the Jobs sheet.
+    Returns the number of rows inserted (int).
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
 
-    # Existing records for dedupe
-    existing_records = sheet.get_all_records(expected_headers=headers)
+    # Build existing key set (source:source_job_id)
+    all_values = sheet.get_all_values()
     existing_keys: Set[str] = set()
-    for row in existing_records:
-        source = _normalize_text(row.get("source"))
-        sid = _normalize_text(str(row.get("source_job_id", "")))
-        if source and sid:
-            existing_keys.add(f"{source}:{sid}")
 
-    logger.info("Loaded %d existing rows from Jobs sheet (for NoDesk ingest)", len(existing_records))
+    def _find_col(name: str) -> Optional[int]:
+        try:
+            return headers.index(name)
+        except ValueError:
+            return None
 
-    html = _fetch_html(NODESK_URL)
-    if not html:
-        logger.warning("No HTML fetched from NODESK_URL")
-        return 0
+    idx_source = _find_col("source")
+    idx_sid = _find_col("source_job_id")
 
-    soup = BeautifulSoup(html, "html.parser")
+    if all_values and idx_source is not None and idx_sid is not None:
+        for row in all_values[1:]:
+            src = _normalize_text(row[idx_source]) if idx_source < len(row) else ""
+            sid = _normalize_text(row[idx_sid]) if idx_sid < len(row) else ""
+            if src and sid:
+                existing_keys.add(f"{src}:{sid}")
+
+    logger.info(
+        "Loaded %d existing rows from Jobs sheet (NoDesk dedupe)",
+        len(all_values) - 1 if all_values else 0,
+    )
+
+    # Fetch NoDesk remote-first jobs page
+    headers_req = {
+        "User-Agent": "ASAPJobsBot/1.0 (contact: youremail@example.com)",
+    }
+    logger.info("Fetching jobs from NoDesk: %s", NODESK_JOBS_URL)
+    resp = requests.get(NODESK_JOBS_URL, headers=headers_req, timeout=30)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
     new_rows: List[List[Any]] = []
     inserted = 0
 
-    # Best-effort parsing: look for links under /remote-jobs/
-    for a in soup.find_all("a", href=True):
+    # Each job is in an <h2> with a link to /remote-jobs/<slug>/
+    h2_tags = soup.find_all("h2")
+    logger.info("Found %d <h2> tags on NoDesk page", len(h2_tags))
+
+    for h2 in h2_tags:
+        a = h2.find("a", href=True)
+        if not a:
+            continue
+
         href = a["href"]
-        if "/remote-jobs/" not in href:
-            continue
-        # Skip top category pages like "/remote-jobs/"
-        if href.rstrip("/").endswith("/remote-jobs"):
+        if not href:
             continue
 
-        url = urljoin(NODESK_URL, href)
+        url = href
+        if not url.startswith("http"):
+            url = urljoin("https://nodesk.co", url)
 
-        # Try to get title, company, location from nearby text
-        title = ""
-        company = ""
-        location = ""
-
-        # Common patterns: headings/text inside the link
-        title_el = a.find(["h2", "h3"])
-        if title_el:
-            title = (title_el.get_text() or "").strip()
-        else:
-            title = (a.get_text() or "").strip()
-
-        # Very rough heuristics – can be improved later when we inspect markup
-        # e.g. company and location might be in small / span tags
-        smalls = a.find_all("small")
-        if smalls:
-            # often something like: "<small>Company · Remote - US</small>"
-            parts = [s.get_text(strip=True) for s in smalls if s.get_text(strip=True)]
-            if parts:
-                # last piece often contains location, look for "Remote"
-                for p in parts:
-                    if "remote" in p.lower():
-                        location = p
-                if not location:
-                    location = parts[-1]
-                company = parts[0]
-
-        if not location:
-            # fallback: treat as worldwide remote
-            location = "Remote - Worldwide"
-
-        raw_job = {
-            "title": title,
-            "company": company,
-            "url": url,
-            "location": location,
-        }
-
-        row_dict = _normalize_nodesk_job(raw_job, headers)
-        if not row_dict:
+        # Only job detail pages
+        if "/remote-jobs/collections" in url:
+            continue
+        if "/remote-jobs/" not in url:
             continue
 
-        key = f"NoDesk:{row_dict.get('source_job_id')}"
+        source_job_id = _extract_source_job_id(url)
+        key = f"NoDesk:{source_job_id}"
         if key in existing_keys:
+            continue
+
+        row_dict = _normalize_nodesk_job(h2, headers)
+        if not row_dict:
             continue
 
         row_values = [row_dict.get(col, "") for col in headers]
         new_rows.append(row_values)
-        existing_keys.add(key)
         inserted += 1
 
     if new_rows:
@@ -240,5 +752,5 @@ def ingest_nodesk() -> int:
 
 
 if __name__ == "__main__":
-    count = ingest_nodesk()
-    print(f"Ingested {count} new NoDesk jobs.")
+    inserted = ingest_nodesk()
+    print(f"Ingested {inserted} new NoDesk jobs.")

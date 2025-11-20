@@ -97,7 +97,7 @@ def _parse_float(value: Any) -> Optional[float]:
 
 
 # --------------------------------------------------------------------
-# Remote / hybrid scope helper
+# Remote / hybrid scope helper  (SHARED by all job boards)
 # --------------------------------------------------------------------
 
 
@@ -105,11 +105,26 @@ def compute_remote_scope(location: str) -> str:
     """
     Classify how 'broad' the remote access is based on location text.
 
+    IMPORTANT: we now only accept locations that *explicitly* look remote,
+    for example:
+
+        "Remote"
+        "Remote - Worldwide"
+        "Remote - US"
+        "Remote - Europe"
+        "Remote - LATAM"
+        "Remote - APAC"
+        "Remote - India"
+
+    If the string does NOT contain any remote keywords (remote, worldwide,
+    anywhere, work from home, etc.), we treat it as "onsite" and the job
+    will be skipped by the ingest scripts.
+
     Returns one of:
     - "global"   -> worldwide / anywhere / global remote
     - "regional" -> region-based (EMEA, LATAM, APAC, Europe, etc.)
-    - "country"  -> specific country-level (USA, Canada, UK, Germany, etc.)
-    - "onsite"   -> explicitly non-remote/office-only
+    - "country"  -> specific country-level remote (USA, Canada, UK, etc.)
+    - "onsite"   -> explicitly non-remote/office-only OR missing remote words
     - "unknown"  -> anything ambiguous or too specific (city-only, etc.)
     """
     loc = (location or "").strip()
@@ -133,32 +148,70 @@ def compute_remote_scope(location: str) -> str:
     if any(m in lower for m in onsite_markers):
         return "onsite"
 
+    # Must look explicitly remote
+    remote_keywords = [
+        "remote",
+        "anywhere",
+        "worldwide",
+        "work from home",
+        "work-from-home",
+        "work from anywhere",
+    ]
+    if not any(k in lower for k in remote_keywords):
+        # e.g. "USA", "Canada", "Berlin" → treat as onsite / skip
+        return "onsite"
+
+    # If it's just "remote" (or very close), call it global
+    if lower in {"remote", "remote only"}:
+        return "global"
+
     # Global
     if any(k in lower for k in ["worldwide", "world wide", "anywhere", "global"]):
-        return "global"
-    if lower in {"remote", "remote only"}:
         return "global"
 
     # Region-level markers
     region_markers = [
-        "emea", "latam", "apac",
-        "europe", "asia", "africa",
-        "middle east", "south america",
-        "north america", "central america",
-        "cst +/-", "cet +/-", "gmt+",
-        "gmt-", "utc+", "utc-",
+        "remote - emea",
+        "remote – emea",
+        "remote - europe",
+        "remote – europe",
+        "remote - apac",
+        "remote – apac",
+        "remote - asia",
+        "remote – asia",
+        "remote - africa",
+        "remote – africa",
+        "remote - latin america",
+        "remote – latin america",
+        "remote - latam",
+        "remote – latam",
+        "remote - north america",
+        "remote – north america",
+        "remote - south america",
+        "remote – south america",
+        "emea",
+        "latam",
+        "apac",
+        "europe",
+        "asia",
+        "africa",
+        "middle east",
+        "south america",
+        "north america",
+        "central america",
     ]
     if any(m in lower for m in region_markers):
         return "regional"
 
-    # If location is a comma-separated list of countries / regions, treat as regional
+    # If location is a comma-separated list of multiple regions/countries,
+    # but it already contains "remote", treat as regional.
     if "," in loc:
         return "regional"
 
-    # Country-level heuristics: single-token countries / well-known short codes
+    # Country-level heuristics
     country_tokens = {
-        "usa", "us", "united states",
-        "canada", "uk", "united kingdom",
+        "us", "u.s.", "u.s", "usa", "united states",
+        "canada", "uk", "u.k.", "united kingdom",
         "germany", "france", "spain", "italy",
         "poland", "netherlands", "belgium",
         "sweden", "norway", "denmark", "finland",
@@ -170,15 +223,14 @@ def compute_remote_scope(location: str) -> str:
         "south africa", "nigeria", "kenya",
         "japan", "south korea",
     }
-    if lower in country_tokens:
-        return "country"
 
-    # If it looks like "Remote - USA" style
+    # Patterns like "Remote - US", "US - Remote", "Remote (US only)" etc.
     for c in country_tokens:
         if c in lower:
             return "country"
 
-    return "unknown"
+    # Fallback: it's clearly remote but we couldn't classify region vs country
+    return "global"
 
 
 # --------------------------------------------------------------------

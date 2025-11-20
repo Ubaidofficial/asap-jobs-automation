@@ -32,10 +32,10 @@ def get_gspread_client():
 def get_jobs_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(JOBS_SHEET_ID)
-    return sh.sheet1  # uses first tab
+    return sh.Jobs_sheet1  # uses first tab
 
 
 def get_subscribers_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(SUBSCRIBERS_SHEET_ID)
-    return sh.sheet1  # uses first tab
+    return sh.Subscribers_sheet1  # uses first tab

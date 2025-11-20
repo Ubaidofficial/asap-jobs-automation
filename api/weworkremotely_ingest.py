@@ -1,3 +1,5 @@
+# api/weworkremotely_ingest.py
+
 from http.server import BaseHTTPRequestHandler
 import json
 import logging
@@ -11,7 +13,11 @@ logger.setLevel(logging.INFO)
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """
-        GET /api/weworkremotely_ingest
+        Vercel Python entrypoint for GET /api/weworkremotely_ingest
+
+        - Calls ingest_weworkremotely()
+        - Only inserts Remote / Hybrid jobs (via remote_scope filter)
+        - Returns JSON summary
         """
         try:
             inserted = ingest_weworkremotely()

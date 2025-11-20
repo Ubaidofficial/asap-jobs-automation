@@ -1,11 +1,10 @@
-# sheets_client.py
 import os
 import json
 import gspread
 from google.oauth2.service_account import Credentials
 
 # 👉 Correct mapping:
-# Jobs sheet:      1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g
+# Jobs sheet:        1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g
 # Subscribers sheet: 1viyKdvfA5BN3g1gF8ZMWlTZmsafiXwOqNw6oVgkguJ0
 
 JOBS_SHEET_ID = "1tdFJX2Wk5VRyxg2DEn_ChbnwuUAScguQXyXM7yWY7_g"
@@ -32,10 +31,12 @@ def get_gspread_client():
 def get_jobs_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(JOBS_SHEET_ID)
-    return sh.Jobs_sheet1  # uses first tab
+    # ✅ ALWAYS use the *first* worksheet.
+    # This works no matter what the tab is named ("Sheet1", "Jobs_sheet1", etc.)
+    return sh.sheet1
 
 
 def get_subscribers_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(SUBSCRIBERS_SHEET_ID)
-    return sh.Subscribers_sheet1  # uses first tab
+    return sh.sheet1  # first tab for subscribers too

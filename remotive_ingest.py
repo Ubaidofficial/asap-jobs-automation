@@ -2,22 +2,25 @@
 """
 Fetch jobs from Remotive and store them in the Jobs Google Sheet.
 
-Source: Remotive public API (remote-only jobs)
-  https://remotive.com/api/remote-jobs
-
-We map into the same Jobs sheet schema as RemoteOK:
+- Uses Remotive public API: https://remotive.com/api/remote-jobs
+- Maps fields into your Jobs sheet columns:
     id, title, company, source, url, apply_url, source_job_id, location,
     job_roles, job_category, seniority, employment_type,
     tags, tech_stack, min_salary, max_salary, currency,
     high_salary, posted_at, ingested_at, remote_scope
-
-We dedupe on (source, source_job_id).
+- Skips jobs that already exist (same source + source_job_id)
+- Filters to clearly remote-only jobs:
+    1) remote_scope ∈ {global, country, regional}
+    2) location text contains remote keywords (remote, worldwide, anywhere, etc.)
 """
 
+from __future__ import annotations
+
 import os
+import re
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -27,7 +30,6 @@ from remoteok_ingest import (
     _ensure_headers,
     _normalize_text,
     _to_str,
-    _parse_float,
     extract_tech_stack,
     normalize_role,
     normalize_category,
@@ -43,163 +45,166 @@ load_dotenv()
 logger = logging.getLogger("remotive_ingest")
 logger.setLevel(logging.INFO)
 
-REMOTIVE_API_URL = os.environ.get("REMOTIVE_API_URL", "https://remotive.com/api/remote-jobs")
+REMOTIVE_API_URL = os.environ.get(
+    "REMOTIVE_API_URL",
+    "https://remotive.com/api/remote-jobs?limit=2000",
+)
 
 
-def _is_remote_or_hybrid(
-    location: str,
-    job_type: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-) -> bool:
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _looks_remote_location(location: str) -> bool:
     """
-    Accept:
-    - Fully remote (worldwide / anywhere / remote)
-    - Remote but region/country-limited (e.g. "USA", "EMEA", "LATAM")
-    - Hybrid roles (where "hybrid" or "partly remote" appears)
+    Extra strict check to ensure the job is clearly remote, based on the raw
+    location text Remotive provides.
 
-    Reject:
-    - Explicitly on-site only roles ("onsite only", "in-office only", "no remote", etc.)
+    Examples that should pass:
+      - "Remote"
+      - "Remote - USA"
+      - "US / Remote"
+      - "Remote: Europe"
+      - "Worldwide"
+      - "Work from anywhere"
+      - "Anywhere in the world"
     """
-    loc = (location or "").lower()
-    jt = (job_type or "").lower()
-    text = " ".join([
-        loc,
-        jt,
-        (title or "").lower(),
-        (description or "").lower(),
-    ])
-
-    # 1) Hard reject explicit on-site only signals
-    onsite_markers = [
-        "onsite only",
-        "on-site only",
-        "in office only",
-        "in-office only",
-        "no remote",
-        "not remote",
-        "must be on site",
-        "must be onsite",
-    ]
-    if any(p in text for p in onsite_markers):
+    loc = (location or "").strip()
+    if not loc:
         return False
 
-    # 2) Accept if clearly remote
-    remote_markers = [
+    lower = loc.lower()
+
+    # Strong remote keywords
+    remote_keywords = [
         "remote",
+        "worldwide",
+        "world wide",
+        "anywhere",
+        "work from anywhere",
+        "work-from-anywhere",
         "work from home",
         "work-from-home",
-        "anywhere",
-        "worldwide",
-        "global",
-        "distributed team",
     ]
-    if any(p in text for p in remote_markers):
-        return True
 
-    # 3) Accept hybrid roles explicitly
-    hybrid_markers = [
-        "hybrid",
-        "partly remote",
-        "part-remote",
-    ]
-    if any(p in text for p in hybrid_markers):
-        return True
+    return any(k in lower for k in remote_keywords)
 
-    # 4) Accept region/country-locked remote (Remotive context is remote-first)
-    region_markers = [
-        "usa",
-        "united states",
-        "canada",
-        "uk",
-        "united kingdom",
-        "europe",
-        "eu",
-        "emea",
-        "latam",
-        "apac",
-        "asia",
-        "australia",
-        "new zealand",
-        "south africa",
-        "brazil",
-        "mexico",
-        "argentina",
-        "colombia",
-        "india",
-        "philippines",
-    ]
-    if any(r in loc for r in region_markers):
-        return True
 
-    # If it's something weird like a pure city name with no remote/region context,
-    # be safe and drop it.
-    return False
+def _parse_salary_range(s: Optional[str]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Parse a Remotive salary string like:
+      "$60,000 - $80,000"
+      "USD 80k-120k"
+      "€70,000"
+    into (min_salary, max_salary, currency).
+
+    Very best-effort, safe to fail to (None, None, "USD").
+    """
+    if not s:
+        return None, None, "USD"
+
+    text = s.strip()
+    lower = text.lower()
+
+    # Currency guessing
+    if "$" in text or "usd" in lower:
+        currency = "USD"
+    elif "€" in text or "eur" in lower:
+        currency = "EUR"
+    elif "£" in text or "gbp" in lower:
+        currency = "GBP"
+    else:
+        currency = "USD"
+
+    # Extract all numeric chunks
+    nums = re.findall(r"[\d,]+(?:\.\d+)?", text)
+    if not nums:
+        return None, None, currency
+
+    def _to_float(num_str: str) -> Optional[float]:
+        try:
+            return float(num_str.replace(",", ""))
+        except Exception:
+            return None
+
+    values = [_to_float(n) for n in nums]
+    values = [v for v in values if v is not None]
+
+    if not values:
+        return None, None, currency
+
+    if len(values) == 1:
+        return values[0], None, currency
+
+    return values[0], values[-1], currency
 
 
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Optional[Dict[str, Any]]:
     """
-    Map a Remotive job JSON object to our Jobs sheet columns.
+    Convert one Remotive job object into a dict keyed by column name.
+
+    Only returns a row if:
+      - remote_scope ∈ {global, country, regional}
+      - AND the raw location text clearly indicates remote
+        (remote / worldwide / anywhere / work from anywhere / etc.).
     """
-    job_id = job.get("id")
-    if not job_id:
+    # Identify job
+    raw_id = job.get("id") or job.get("job_id")
+    if not raw_id:
         return None
 
-    source_job_id = _to_str(job_id)
+    source_job_id = _to_str(raw_id)
     row_id = f"remotive_{source_job_id}"
 
     title = job.get("title") or ""
-    company = job.get("company_name") or ""
+    company = job.get("company_name") or job.get("company") or ""
+
+    # Remotive "url" usually points to the job page
     url = job.get("url") or ""
 
-    location = job.get("candidate_required_location") or "Remote"
-    job_type = job.get("job_type") or ""  # full_time / contract / part_time / freelance / internship
-    description = job.get("description") or ""
+    # Location: Remotive uses "candidate_required_location" for geo
+    location = (
+        job.get("candidate_required_location")
+        or job.get("location")
+        or "Remote"
+    )
 
-    # Filter to remote / hybrid only (extra safety)
-    if not _is_remote_or_hybrid(location, job_type, title, description):
+    # Compute remote scope
+    remote_scope = compute_remote_scope(location)
+
+    # Filter to remote/hybrid only, and location text must clearly look remote
+    if remote_scope not in {"global", "country", "regional"}:
         return None
 
-    # Tags – Remotive gives a list of strings in "tags"
-    tags_list = job.get("tags") or []
-    if not isinstance(tags_list, list):
-        tags_list = []
-    tags_list = [str(t).strip() for t in tags_list if str(t).strip()]
-    tags_str = ", ".join(tags_list)
+    if not _looks_remote_location(location):
+        return None
 
-    tech_stack_list = extract_tech_stack(tags_list)
+    # Tags & tech stack
+    tags_list = job.get("tags") or job.get("job_tags") or []
+    tags_str_list = [str(t).strip() for t in tags_list if str(t).strip()]
+    tags_str = ", ".join(tags_str_list)
+    tech_stack_list = extract_tech_stack(tags_str_list)
     tech_stack_str = ", ".join(tech_stack_list)
 
-    # Salary – Remotive gives a free-text salary, often in USD like "$40,000 - $50,000"
-    salary_text = (job.get("salary") or "").strip()
-    min_salary_num: Optional[float] = None
-    max_salary_num: Optional[float] = None
-    currency = "USD"
-
-    if salary_text:
-        # Very light parsing: look for first two numbers
-        import re
-
-        nums = re.findall(r"[\d,]+", salary_text)
-        if nums:
-            min_salary_num = _parse_float(nums[0])
-        if len(nums) >= 2:
-            max_salary_num = _parse_float(nums[1])
+    # Salary parsing (best-effort)
+    salary_str = job.get("salary") or ""
+    min_salary_num, max_salary_num, currency = _parse_salary_range(salary_str)
 
     min_salary = "" if min_salary_num is None else min_salary_num
     max_salary = "" if max_salary_num is None else max_salary_num
 
     high_salary_flag = is_high_salary(min_salary_num, max_salary_num, currency, threshold=HIGH_SALARY_THRESHOLD)
 
-    posted_at = _to_str(job.get("publication_date") or "")
-    ingested_at = datetime.now(timezone.utc).isoformat()
+    posted_at = _to_str(job.get("publication_date") or job.get("date") or "")
+    ingested_at = _now_iso()
 
-    role = normalize_role(title, tags_list)
-    category = normalize_category(title, tags_list, role)
-    seniority = extract_seniority(title, tags_list)
-    employment_type = extract_employment_type(job_type, tags_list)
+    role = normalize_role(title, tags_str_list)
+    category = normalize_category(title, tags_str_list, role)
+    seniority = extract_seniority(title, tags_str_list)
+    employment_type = extract_employment_type(title, tags_str_list)
 
-    remote_scope = compute_remote_scope(location)
+    # For Remotive, we'll use the Remotive URL as apply_url
+    apply_url = url
 
     row_dict: Dict[str, Any] = {
         "id": row_id,
@@ -207,8 +212,7 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Optional
         "company": company,
         "source": "Remotive",
         "url": url,
-        # Remotive's URL is both listing + apply, so we keep it in both fields
-        "apply_url": url,
+        "apply_url": apply_url,
         "source_job_id": source_job_id,
         "location": location,
         "job_roles": role,
@@ -226,7 +230,7 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Optional
         "remote_scope": remote_scope,
     }
 
-    # Only keep keys present in sheet header
+    # Strip keys not present in the sheet headers
     for key in list(row_dict.keys()):
         if key not in headers:
             row_dict.pop(key, None)
@@ -237,54 +241,80 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Optional
 def ingest_remotive() -> int:
     """
     Fetch Remotive jobs and append new ones to the Jobs sheet.
-    Returns the number of rows inserted.
+    Returns the number of rows inserted (int).
+
+    Only clearly remote jobs are inserted:
+      - remote_scope ∈ {global, country, regional}
+      - AND location text looks remote ("Remote", "Worldwide", "Anywhere", etc.)
     """
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
 
-    # Build existing key set (source:source_job_id)
-    # ✅ pass expected_headers to avoid "header row not unique" error
-    existing_records = sheet.get_all_records(expected_headers=headers)
-
+    # Dedupe: build existing key set (source:source_job_id) from raw values
+    all_values = sheet.get_all_values()
     existing_keys: Set[str] = set()
-    for row in existing_records:
-        source = _normalize_text(row.get("source"))
-        sid = _normalize_text(str(row.get("source_job_id", "")))
-        if source and sid:
-            existing_keys.add(f"{source}:{sid}")
 
-    logger.info("Loaded %d existing rows from Jobs sheet (for Remotive ingest)", len(existing_records))
+    def _find_col(name: str) -> Optional[int]:
+        try:
+            return headers.index(name)
+        except ValueError:
+            return None
+
+    idx_source = _find_col("source")
+    idx_sid = _find_col("source_job_id")
+
+    if all_values and idx_source is not None and idx_sid is not None:
+        for row in all_values[1:]:  # skip header
+            src = _normalize_text(row[idx_source]) if idx_source < len(row) else ""
+            sid = _normalize_text(row[idx_sid]) if idx_sid < len(row) else ""
+            if src and sid:
+                existing_keys.add(f"{src}:{sid}")
+
+    logger.info(
+        "Loaded %d existing rows from Jobs sheet (Remotive dedupe)",
+        len(all_values) - 1 if all_values else 0,
+    )
 
     # Call Remotive API
+    headers_req = {
+        "User-Agent": "ASAPJobsBot/1.0 (contact: youremail@example.com)",
+    }
     logger.info("Fetching jobs from Remotive API: %s", REMOTIVE_API_URL)
-    resp = requests.get(
-        REMOTIVE_API_URL,
-        headers={"User-Agent": "ASAPJobsBot/1.0 (contact: youremail@example.com)"},
-        timeout=20,
-    )
+    resp = requests.get(REMOTIVE_API_URL, headers=headers_req, timeout=25)
     resp.raise_for_status()
     data = resp.json()
 
-    jobs = data.get("jobs") or []
+    # Remotive API usually returns {"jobs": [ ... ]}
+    if isinstance(data, dict) and "jobs" in data:
+        jobs = [j for j in data["jobs"] if isinstance(j, dict)]
+    elif isinstance(data, list):
+        jobs = [j for j in data if isinstance(j, dict)]
+    else:
+        jobs = []
+
     logger.info("Fetched %d jobs from Remotive API", len(jobs))
 
     new_rows: List[List[Any]] = []
     inserted = 0
 
     for job in jobs:
-        source_job_id = _to_str(job.get("id"))
-        key = f"Remotive:{source_job_id}"
+        raw_id = job.get("id") or job.get("job_id")
+        if not raw_id:
+            continue
 
+        source_job_id = _to_str(raw_id)
+        key = f"Remotive:{source_job_id}"
         if key in existing_keys:
             continue
 
         row_dict = _normalize_remotive_job(job, headers)
         if not row_dict:
-            continue
+            continue  # filtered out (not clearly remote / invalid)
 
         row_values = [row_dict.get(col, "") for col in headers]
         new_rows.append(row_values)
         inserted += 1
+        existing_keys.add(key)
 
     if new_rows:
         logger.info("Appending %d new Remotive rows to Jobs sheet", len(new_rows))

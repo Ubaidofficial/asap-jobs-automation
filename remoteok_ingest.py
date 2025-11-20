@@ -9,7 +9,7 @@ Fetch jobs from RemoteOK and store them in the Jobs Google Sheet.
     tags, tech_stack, min_salary, max_salary, currency,
     high_salary, posted_at, ingested_at, remote_scope
 - Skips jobs that already exist (same source + source_job_id)
-- NEW: Filters to remote / hybrid only at ingestion time:
+- Filters to remote / hybrid only at ingestion time:
     only rows with remote_scope ∈ {global, country, regional} are inserted.
 """
 
@@ -637,17 +637,27 @@ def ingest_remoteok() -> int:
     sheet = get_jobs_sheet()
     headers = _ensure_headers(sheet)
 
-    # Existing jobs – dedupe by (source, source_job_id)
-    # IMPORTANT: use expected_headers to avoid "header row not unique" error.
-    existing_records = sheet.get_all_records(expected_headers=headers)
+    # Build existing key set (source:source_job_id) WITHOUT get_all_records()
+    all_values = sheet.get_all_values()
     existing_keys: Set[str] = set()
-    for row in existing_records:
-        source = _normalize_text(row.get("source"))
-        sid = _normalize_text(str(row.get("source_job_id", "")))
-        if source and sid:
-            existing_keys.add(f"{source}:{sid}")
 
-    logger.info("Loaded %d existing rows from Jobs sheet", len(existing_records))
+    def _find_col(name: str) -> Optional[int]:
+        try:
+            return headers.index(name)
+        except ValueError:
+            return None
+
+    idx_source = _find_col("source")
+    idx_sid = _find_col("source_job_id")
+
+    if all_values and idx_source is not None and idx_sid is not None:
+        for row in all_values[1:]:  # skip header row
+            src = _normalize_text(row[idx_source]) if idx_source < len(row) else ""
+            sid = _normalize_text(row[idx_sid]) if idx_sid < len(row) else ""
+            if src and sid:
+                existing_keys.add(f"{src}:{sid}")
+
+    logger.info("Loaded %d existing rows from Jobs sheet (RemoteOK dedupe)", len(all_values) - 1 if all_values else 0)
 
     # Call RemoteOK API
     headers_req = {
@@ -688,7 +698,7 @@ def ingest_remoteok() -> int:
         inserted += 1
 
     if new_rows:
-        logger.info("Appending %d new rows to Jobs sheet", len(new_rows))
+        logger.info("Appending %d new RemoteOK rows to Jobs sheet", len(new_rows))
         sheet.append_rows(new_rows, value_input_option="RAW")
     else:
         logger.info("No new RemoteOK jobs to insert")

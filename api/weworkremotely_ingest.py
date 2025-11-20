@@ -14,10 +14,6 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """
         Vercel Python entrypoint for GET /api/weworkremotely_ingest
-
-        - Calls ingest_weworkremotely()
-        - Only inserts Remote / Hybrid jobs (via remote_scope filter)
-        - Returns JSON summary
         """
         try:
             inserted = ingest_weworkremotely()

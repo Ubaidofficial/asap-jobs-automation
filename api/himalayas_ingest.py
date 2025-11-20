@@ -14,10 +14,6 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """
         Vercel Python entrypoint for GET /api/himalayas_ingest
-
-        - Calls ingest_himalayas()
-        - Only inserts Remote / Hybrid jobs (via remote_scope filter)
-        - Returns JSON summary
         """
         try:
             inserted = ingest_himalayas()

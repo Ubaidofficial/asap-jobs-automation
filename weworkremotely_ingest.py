@@ -41,6 +41,15 @@ from remoteok_ingest import (
     compute_remote_scope,
 )
 
+# Optional logging_utils – won't break if file/module not present
+try:
+    from logging_utils import log_event  # type: ignore
+except Exception:
+    def log_event(source: str, event: str, **kwargs):
+        logging.getLogger("weworkremotely_ingest").info(
+            "log_event fallback: %s %s %s", source, event, kwargs
+        )
+
 load_dotenv()
 
 logger = logging.getLogger("weworkremotely_ingest")
@@ -112,7 +121,9 @@ def _normalize_wwr_job(job: Dict[str, Any], headers: List[str]) -> Optional[Dict
     currency = "USD"
     min_salary = ""
     max_salary = ""
-    high_salary_flag = is_high_salary(min_salary_num, max_salary_num, currency, threshold=HIGH_SALARY_THRESHOLD)
+    high_salary_flag = is_high_salary(
+        min_salary_num, max_salary_num, currency, threshold=HIGH_SALARY_THRESHOLD
+    )
 
     posted_at = ""  # WWR lists relative time; we could parse later if needed
     ingested_at = _now_iso()
@@ -170,6 +181,7 @@ def ingest_weworkremotely() -> int:
     html = _fetch_html(WWR_URL)
     if not html:
         logger.warning("No HTML fetched from WWR_URL")
+        log_event("WeWorkRemotely", "ingest_error", inserted=0, error="Failed to fetch HTML")
         return 0
 
     soup = BeautifulSoup(html, "html.parser")
@@ -221,8 +233,10 @@ def ingest_weworkremotely() -> int:
     if new_rows:
         logger.info("Appending %d new WWR rows to Jobs sheet", len(new_rows))
         sheet.append_rows(new_rows, value_input_option="RAW")
+        log_event("WeWorkRemotely", "ingest_ok", inserted=inserted)
     else:
-        logger.info("No new WeWorkRemotely jobs to insert")
+        logger.info("No new WWR jobs to insert")
+        log_event("WeWorkRemotely", "ingest_ok", inserted=0)
 
     return inserted
 

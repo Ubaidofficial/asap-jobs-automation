@@ -11,7 +11,7 @@ We map into the same Jobs sheet schema as RemoteOK:
     tags, tech_stack, min_salary, max_salary, currency,
     high_salary, posted_at, ingested_at, remote_scope
 
-We dedupe on (source, source_job_id).
+We dedupe on (source, source_job_id) and only keep clearly remote/hybrid roles.
 """
 
 import os
@@ -43,7 +43,41 @@ load_dotenv()
 logger = logging.getLogger("remotive_ingest")
 logger.setLevel(logging.INFO)
 
-REMOTIVE_API_URL = os.environ.get("REMOTIVE_API_URL", "https://remotive.com/api/remote-jobs")
+REMOTIVE_API_URL = os.environ.get(
+    "REMOTIVE_API_URL",
+    "https://remotive.com/api/remote-jobs",
+)
+
+
+# --------------------------------------------------------------------
+# Helpers for remote / hybrid detection + location formatting
+# --------------------------------------------------------------------
+
+
+def _normalize_remotive_location(raw: str) -> str:
+    """
+    Format Remotive's candidate_required_location into our preferred style,
+    keeping the original wording (Option B) but always prefixing with "Remote".
+
+    Examples:
+      ""                      -> "Remote"
+      "USA"                   -> "Remote – USA"
+      "Europe, USA"           -> "Remote – Europe, USA"
+      "Worldwide"             -> "Remote – Worldwide"
+      "Northern America, EMEA, APAC" -> "Remote – Northern America, EMEA, APAC"
+    """
+    if not raw:
+        return "Remote"
+
+    loc = raw.strip()
+    lower = loc.lower()
+
+    # Global-ish markers
+    if any(k in lower for k in ["anywhere", "worldwide", "global", "multiple countries", "international"]):
+        return f"Remote – {loc}"
+
+    # Default: keep Remotive's text but prefix with Remote
+    return f"Remote – {loc}"
 
 
 def _is_remote_or_hybrid(
@@ -60,6 +94,8 @@ def _is_remote_or_hybrid(
 
     Reject:
     - Explicitly on-site only roles ("onsite only", "in-office only", "no remote", etc.)
+    - Weird pure-city strings with NO remote / region / country markers
+      (be conservative and drop them).
     """
     loc = (location or "").lower()
     jt = (job_type or "").lower()
@@ -80,11 +116,13 @@ def _is_remote_or_hybrid(
         "not remote",
         "must be on site",
         "must be onsite",
+        "office-based",
+        "office based",
     ]
     if any(p in text for p in onsite_markers):
         return False
 
-    # 2) Accept if clearly remote
+    # 2) Accept if clearly remote / WFH
     remote_markers = [
         "remote",
         "work from home",
@@ -102,44 +140,70 @@ def _is_remote_or_hybrid(
         "hybrid",
         "partly remote",
         "part-remote",
+        "partial remote",
     ]
     if any(p in text for p in hybrid_markers):
         return True
 
     # 4) Accept region/country-locked remote (Remotive context is remote-first)
     region_markers = [
-        "usa",
-        "united states",
-        "canada",
-        "uk",
-        "united kingdom",
+        # broad regions
         "europe",
         "eu",
         "emea",
         "latam",
         "apac",
         "asia",
+        "americas",
+        "northern america",
+        "southern america",
+        "south america",
+        "north america",
+        "africa",
+        "middle east",
         "australia",
         "new zealand",
-        "south africa",
+        # major countries (often used as "remote from X")
+        "usa",
+        "united states",
+        "canada",
+        "uk",
+        "united kingdom",
         "brazil",
         "mexico",
         "argentina",
         "colombia",
+        "spain",
+        "germany",
+        "france",
+        "italy",
+        "portugal",
+        "poland",
         "india",
         "philippines",
+        "south africa",
+        "thailand",
     ]
     if any(r in loc for r in region_markers):
         return True
 
-    # If it's something weird like a pure city name with no remote/region context,
-    # be safe and drop it.
+    # 5) Otherwise, treat pure city-only strings with no region markers as non-remote.
+    #    This is conservative (we might drop some legit remote roles) but avoids
+    #    obvious onsite mislabelled as remote.
     return False
+
+
+# --------------------------------------------------------------------
+# Normalize a single Remotive job
+# --------------------------------------------------------------------
 
 
 def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str, Any] | None:
     """
     Map a Remotive job JSON object to our Jobs sheet columns.
+    Only returns a row if:
+      - _is_remote_or_hybrid(...) is True
+      - compute_remote_scope(...) ∈ {global, country, regional}
     """
     job_id = job.get("id")
     if not job_id:
@@ -152,12 +216,20 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     company = job.get("company_name") or ""
     url = job.get("url") or ""
 
-    location = job.get("candidate_required_location") or "Remote"
+    raw_location = job.get("candidate_required_location") or ""
+    # Filter to remote / hybrid only (extra safety)
     job_type = job.get("job_type") or ""  # full_time / contract / part_time / freelance / internship
     description = job.get("description") or ""
 
-    # Filter to remote / hybrid only (extra safety)
-    if not _is_remote_or_hybrid(location, job_type, title, description):
+    if not _is_remote_or_hybrid(raw_location, job_type, title, description):
+        return None
+
+    # Format location like RemoteOK style, but keep Remotive wording (Option B)
+    location = _normalize_remotive_location(raw_location or "Remote")
+
+    # remote_scope based on normalized location; must be one of allowed values
+    remote_scope = compute_remote_scope(location)
+    if remote_scope not in {"global", "country", "regional"}:
         return None
 
     # Tags – Remotive gives a list of strings in "tags"
@@ -189,7 +261,12 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     min_salary = "" if min_salary_num is None else min_salary_num
     max_salary = "" if max_salary_num is None else max_salary_num
 
-    high_salary_flag = is_high_salary(min_salary_num, max_salary_num, currency, threshold=HIGH_SALARY_THRESHOLD)
+    high_salary_flag = is_high_salary(
+        min_salary_num,
+        max_salary_num,
+        currency,
+        threshold=HIGH_SALARY_THRESHOLD,
+    )
 
     posted_at = _to_str(job.get("publication_date") or "")
     ingested_at = datetime.now(timezone.utc).isoformat()
@@ -198,8 +275,6 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     category = normalize_category(title, tags_list, role)
     seniority = extract_seniority(title, tags_list)
     employment_type = extract_employment_type(job_type, tags_list)
-
-    remote_scope = compute_remote_scope(location)
 
     row_dict: Dict[str, Any] = {
         "id": row_id,
@@ -234,6 +309,11 @@ def _normalize_remotive_job(job: Dict[str, Any], headers: List[str]) -> Dict[str
     return row_dict
 
 
+# --------------------------------------------------------------------
+# Main ingest
+# --------------------------------------------------------------------
+
+
 def ingest_remotive() -> int:
     """
     Fetch Remotive jobs and append new ones to the Jobs sheet.
@@ -253,7 +333,10 @@ def ingest_remotive() -> int:
         if source and sid:
             existing_keys.add(f"{source}:{sid}")
 
-    logger.info("Loaded %d existing rows from Jobs sheet (for Remotive ingest)", len(existing_records))
+    logger.info(
+        "Loaded %d existing rows from Jobs sheet (for Remotive ingest)",
+        len(existing_records),
+    )
 
     # Call Remotive API
     logger.info("Fetching jobs from Remotive API: %s", REMOTIVE_API_URL)
@@ -298,4 +381,3 @@ def ingest_remotive() -> int:
 if __name__ == "__main__":
     count = ingest_remotive()
     print(f"Ingested {count} new Remotive jobs.")
-    
